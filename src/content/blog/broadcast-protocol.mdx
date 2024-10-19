@@ -2,47 +2,61 @@
 title: Giao thức Broadcast trong hệ thống phân tán
 summary: Tổng quan về giao thức broadcast trong hệ thống phân tán
 postLayout: column
-date: '2024-10-10'
+date: "2024-10-10"
 draft: true
-cover: '@/assets/broadcast-protocol/cover.png'
+cover: "@/assets/broadcast-protocol/cover.png"
 tags: [distributed-system]
 ---
-import Figure from "@/components/Figure.astro"
-import receiveAndDelivery from "@/assets/broadcast-protocol/receive-and-delivery.png"
-import fifoExample from "@/assets/broadcast-protocol/fifo-example.png"
-import causalExample from "@/assets/broadcast-protocol/causal-example.png"
+
+import Figure from "@/components/Figure.astro";
+import receiveAndDelivery from "@/assets/broadcast-protocol/receive-and-delivery.png";
+import fifoExample from "@/assets/broadcast-protocol/fifo-example.png";
+import causalExample from "@/assets/broadcast-protocol/causal-example.png";
+import totalOrderExample1 from "@/assets/broadcast-protocol/total-order-broadcast-example-1.png";
+import totalOrderExample2 from "@/assets/broadcast-protocol/total-order-broadcast-example-2.png";
+import hierarchy from "@/assets/broadcast-protocol/hierarchy.png";
 
 
 ## Thứ tự vận chuyển trong giao thức broadcast
 
 ### Giao thức broadcast là gì
+
 - Là giao thức cho phép một node trong nhóm gửi 1 message đến tất cả các node trong nhóm.
 - Số lượng node trong nhóm có thể là cố định hoặt linh động (tăng lên, giảm xuống).
 - Nếu một node trong nhóm bị lỗi, các node còn lại vẫn tiếp tục nhận được message.
 - Giao thức broadcast có thể là:
-    - **best-effort** (nỗ lực tốt nhất): Có thể drop message trong quá trình vận chuyển, chỉ nỗ lực gửi được nhiều nhất
+  - **best-effort** (nỗ lực tốt nhất): Có thể drop message trong quá trình vận chuyển, chỉ nỗ lực gửi được nhiều nhất
     có thể đến các node.
-    - **reliable** (tin cậy): Các node không bị lỗi được nhận tất cả message, với những message nào bị drop thì ta sẽ 
+  - **reliable** (tin cậy): Các node không bị lỗi được nhận tất cả message, với những message nào bị drop thì ta sẽ
     gửi lại cho đến khi nó nhận được.
-    - **asynchronous/partial synchronous** (bất đồng bộ hoặc đồng bộ một phần): Không có giới hạn trên về độ trễ của message,
+  - **asynchronous/partial synchronous** (bất đồng bộ hoặc đồng bộ một phần): Không có giới hạn trên về độ trễ của message,
     tức message có thể chưa đến đích nhưng ta vẫn chấp nhận rằng nó đã được gửi đi.
 
 Ta có thể minh hoạ việc gửi/nhận giữa các node trong nhóm khi sử dụng giao thức broadcast như sau:
-<Figure src={receiveAndDelivery} alt="">Quá trình gửi/nhận message giữa 2 node A và B</Figure>
-Khi một ứng dụng muốn gửi một message đến tất cả các node trong nhóm, nó cần sử dụng 1 thuật toán để thực hiện
-broadcast. Để điều đó có thể xảy ra, thuật toán broadcast phải thực hiện `gửi` những message đó bằng kết nối 1-1
-đến từng node, và các node cũng `nhận` message thông qua kết nối 1-1 rồi thông qua thuật toán broadcast để `chuyển`
-message đến ứng dụng. Vì vậy sẽ có một khoảng thời gian delay giữa việc `nhận` và `chuyển` do thuật toán broadcast.
 
-Ta sẽ tìm hiểu về 3 loại (thật ra là 4 nhưng loại cuối cùng là kết hợp của 2 trong 3 loại ta liệt kê) broadcast và 
+<Figure src={receiveAndDelivery} alt="">
+  Quá trình gửi/nhận message giữa 2 node A và B
+</Figure>
+Khi một ứng dụng muốn gửi một message đến tất cả các node trong nhóm, nó cần sử dụng
+1 thuật toán để thực hiện broadcast. Để điều đó có thể xảy ra, thuật toán broadcast
+phải thực hiện `gửi` những message đó bằng kết nối 1-1 đến từng node, và các node
+cũng `nhận` message thông qua kết nối 1-1 rồi thông qua thuật toán broadcast để `chuyển`
+message đến ứng dụng. Vì vậy sẽ có một khoảng thời gian delay giữa việc `nhận` và
+`chuyển` do thuật toán broadcast.
+
+Ta sẽ tìm hiểu về 3 loại (thật ra là 4 nhưng loại cuối cùng là kết hợp của 2 trong 3 loại ta liệt kê) broadcast và
 tất cả đều là `reliable`. Tuy nhiên sự khác nhau giữa 3 loại này đó chính là thứ tự của message đến các node.
 Sẽ có loại cho ta sự nhất quán giữa thứ tự những message trên các node, nhưng cũng có loại chỉ đảm bảo tính `reliable`
 mà không quan tâm đến thứ tự.
 
 ### FIFO broadcast
+
 FIFO ([F]irst [I]n, [F]irst [O]ut) broadcast là loại yếu nhất trong các giao thức broadcast. Với loại này, những message
 được gửi bởi cùng 1 node phải được gửi theo thứ tự chúng được gửi. Lấy ví dụ như ảnh sau:
-<Figure src={fifoExample} alt="">Ví dụ về FIFO broadcast với thứ tự theo alphabet lần lượt là $A, B, C$</Figure>
+
+<Figure src={fifoExample} alt="">
+  Ví dụ về FIFO broadcast với thứ tự theo alphabet lần lượt là $A, B, C$
+</Figure>
 
 Trong ví dụ trên, $m_1$ phải được chuyển đến trước $m_3$ trong khi cả 2 đều cùng được gửi bởi A. Tuy nhiên $m_2$ có thể
 được chuyển tại bất cứ thời điểm nào trước, sau và ngay cả khi ở giữa $m_1$ và $m_3$ vì $m_2$ được gửi bởi B. Vì vậy, các
@@ -52,21 +66,48 @@ Ta có thể thấy FIFO broadcast vi phạm quan hệ nhân quả khi: node C n
 $m_2$ sau khi nhận được $m_1$. Vì vậy ta sẽ chuyển đến qua Causal broadcast (mình dùng luôn từ gốc vì cũng không biết dịch sao).
 
 ### Causal broadcast
+
 Khác với FIFO broadcast, Causal broadcast đảm bảo rằng những message sẽ được vận chuyển theo thứ tự thoả quan hệ nhân quả:
-Nếu message này được broadcast trước message kia được broadcast thì tất cả các node phải nhận được các message đó đúng theo 
+Nếu message này được broadcast trước message kia được broadcast thì tất cả các node phải nhận được các message đó đúng theo
 thứ tự bằng cách sẽ giữ lại các message sai thứ tự cho đến khi đúng thứ tự mới được nhận. Nếu các message được broadcast đồng thời thì các node có thể nhận nó theo thứ tự bất kì.
-<Figure src={causalExample} alt="">Ví dụ về Causal broadcast với việc đảm bảo $m_1$ luôn được gửi đến 3 node $A, B, C$ trước $m_2$ và $m_3$</Figure>
+
+<Figure src={causalExample} alt="">
+  Ví dụ về Causal broadcast với việc đảm bảo $m_1$ luôn được gửi đến 3 node $A,
+  B, C$ trước $m_2$ và $m_3$
+</Figure>
 
 Trong ví dụ trên, message $m_2$ và $m_3$ được broadcast đồng thời. Vì vậy giữa $m_2$ và $m_3$ có thể theo thứ tự bất kì. Còn $m_1$ luôn được đảm
 bảo được gửi đến trước. Do đó, ta có node A và C sẽ có thứ tự là $(m_1, m_3, m_2)$ trong khi node B sẽ có thứ tự là $(m_1, m_2, m_3)$. Vì cả 2 thứ tự
 đã được liệt kê trên đều thoả mãn quan hệ nhân quả nên cả 2 kết quả đều có thể chấp nhận được.
 
-Tuy nhiên, nó vẫn chưa giải quyết được việc khi các message được broadcast đồng thời, sự nhất quán về thứ tự giữa các 
+Tuy nhiên, nó vẫn chưa giải quyết được việc khi các message được broadcast đồng thời, sự nhất quán về thứ tự giữa các
 node không còn được đảm bảo. Vì vậy ta cần đến loại thứ 3: Total order broadcast
 
 ### Total order broadcast
+
 Total order broadcast (hay còn gọi là atomic broadcast) là loại đảm bảo sự nhất quán giữa tất cả các node về thứ tự message.
 Thứ tự của các message trong 1 node là không quan trọng, miễn là nó đảm bảo thứ tự đó đều giống tất cả các node trong nhóm.
 
-Bằng cách
+Bằng cách giữ lại message cho đến khi đúng thứ tự mới được chuyển đến, total order broadcast cho phép ngay cả khi chính
+message của node đó gửi đến node đó cũng phải đợi cho đến khi đúng lượt. Ta có thể xem 2 ví dụ sau:
 
+<Figure src={totalOrderExample1} alt="">
+  Ví dụ về Total Order broadcast với việc đảm bảo ở cả 3 node luôn nhận được message với thứ tự là $m_1, m_2, m_3$
+</Figure>
+
+<Figure src={totalOrderExample2} alt="">
+  Ví dụ về Total Order broadcast với việc đảm bảo ở cả 3 node luôn nhận được message với thứ tự là $m_1, m_3, m_2$
+</Figure>
+
+### FIFO-Total order broadcast
+
+Cuối cùng là một phiên bản kết hợp giữa 2 loại trên: FIFO và Total order broadcast. Phiên bản này giống như Total order broadcast
+nhưng lại yêu cầu thêm như FIFO rằng các message ở local phải đảm bảo đúng thứ tự. Xét 2 ví dụ trên ở mục Total order broadcast, ta
+có thể thấy 2 ví dụ trên cũng thuộc loại này vì ở node A, $m_1$ đã được gửi đi trước $m_3$.
+
+Ta có thể rút ra được một hệ thống phân cấp các loại trên như sau:
+<Figure src={hierarchy} alt="">
+  Sơ đồ phân cấp các loại broadcast model
+</Figure>
+
+## Broadcast Algorithm

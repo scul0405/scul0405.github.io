@@ -2,20 +2,21 @@
 title: Thời gian và thứ tự event trong hệ thống phân tán
 summary: Tổng quan về thời gian, các loại clock và việc đảm bảo thứ tự trong hệ thống phân tán
 postLayout: column
-date: '2024-10-04'
+date: "2024-10-04"
 draft: false
-cover: '@/assets/time-in-distributed-system/cover.png'
+cover: "@/assets/time-in-distributed-system/cover.png"
 tags: [distributed-system]
 ---
-import Figure from "@/components/Figure.astro"
-import ntpExample from "@/assets/time-in-distributed-system/ntp.png"
-import orderingProblem from "@/assets/time-in-distributed-system/ordering-problem.png"
-import happensBeforeExample from "@/assets/time-in-distributed-system/happens-before-example.png"
-import lamportClockExample from "@/assets/time-in-distributed-system/lamport-clock-example.png"
-import vectorClockExample from "@/assets/time-in-distributed-system/vector-clock-example.png"
 
+import Figure from "@/components/Figure.astro";
+import ntpExample from "@/assets/time-in-distributed-system/ntp.png";
+import orderingProblem from "@/assets/time-in-distributed-system/ordering-problem.png";
+import happensBeforeExample from "@/assets/time-in-distributed-system/happens-before-example.png";
+import lamportClockExample from "@/assets/time-in-distributed-system/lamport-clock-example.png";
+import vectorClockExample from "@/assets/time-in-distributed-system/vector-clock-example.png";
 
 ## Vai trò của thời gian trong hệ thống phân tán
+
 Hệ thống phân tán thường dùng thời gian để:
 
 - Lập lịch, timeout, kiểm tra lỗi, retry …
@@ -29,90 +30,110 @@ Thường được chia thành 2 loại clock:
 - **Clock logic (Logical clocks)**: đếm số event
 
 ## Physical clock
+
 ### Clock Synchronization và Monotonic Clock
+
 #### Clock synchronization
-Máy tính theo dõi thời gian vật lý/UTC với đồng hồ thạch anh (quartz) 
+
+Máy tính theo dõi thời gian vật lý/UTC với đồng hồ thạch anh (quartz)
 (cục pin ở CMOS cấp nguồn điện cho nó luôn hoạt động kể cả máy tính tắt).
 Do thời gian trôi dần trong khi đồng hồ không thể luôn giữ chính xác thời gian nên lỗi đồng hồ tăng dần.
 
 &rarr; **Solution**: Định kì lấy thời gian hiện tại từ máy chủ có nguồn thời gian chính xác hơn (GPS).
 
 ### Network Time Protocol (NTP)
+
 Là một giao thức để đồng bộ đồng hồ của các hệ thống máy tính thông qua mạng dữ liệu chuyển mạch gói với độ trễ biến đổi.
 
 Phương thức hoạt động:
+
 - NTP client gửi một gói tin, trong đó chứa một thẻ thời gian tới cho NTP server.
 - NTP server nhận được gói tin, gửi trả lại NTP client một gói tin khác, có thẻ thời gian là thời điểm nó gửi gói tin đó đi.
 - NTP client nhận được gói tin đó, tính toán độ trễ, dựa và thẻ thời gian mà nó nhận được cùng với độ trễ đường truyền, NTP client sẽ set lại thời gian của nó.
 
-<Figure src={ntpExample} alt="">Ví dụ thứ tự thực hiện khi NTP gửi request đến server</Figure>
+<Figure src={ntpExample} alt="">
+  Ví dụ thứ tự thực hiện khi NTP gửi request đến server
+</Figure>
 
 ### Monotonic và time-day-of clocks
+
 #### Monotonic clock
+
 - Thời gian tính từ 1 thời điểm bất kì (VD: khi bật máy lên)
 - Luôn luôn tăng dần với tốc độ gần như không đổi.
 - Hữu ích khi dùng để đo thời gian trôi qua trên 1 node duy nhất.
 - Trong LINUX: `clock_gettime(CLOCK_MONOTONIC)`
 
 #### Time-day-of clock
+
 - Thời gian tính từ 1 điểm cố định (phổ biến nhất là 01/01/1970, Golang tính từ 02/01/2006)
 - Có thể đột ngột tăng dần hoặc giảm dần (NTP stepping), có thể điều chỉnh giây nhuận.
 - Timestamp có thể được so sánh giữa các node (nếu được đồng bồ hoá)
 - Trong LINUX: `clock_gettime(CLOCK_REALTIME)`
 
 ## Vấn đề về thứ tự với thời gian trong hệ thống phân tán
-<Figure src={orderingProblem} alt="">Ví dụ về thứ tự với thời gian giữa 3 user</Figure>
-Từ hình trên ta có nhận xét:
-- 3 người dùng A, B, C
-- A gửi tin nhắn `m1` đến B và C
-- Khi B nhận được tin nhắn `m1` của A, B nhắn trả lời cho A và C với tin nhắn `m2`.
-- Tuy nhiên, trong quá trình gửi tin, tin nhắn của A đến C chậm hơn so với tin nhắn của B đến C. 
-Lúc này tại C, tin nhắn `m2` sẽ đến trước tin nhắn `m1`.
 
-&rarr; Kết quả tại C là không rõ ràng, C sẽ thấy phản hồi trước khi thấy cả câu hỏi. 
+<Figure src={orderingProblem} alt="">
+  Ví dụ về thứ tự với thời gian giữa 3 user
+</Figure>
+Từ hình trên ta có nhận xét: - 3 người dùng A, B, C - A gửi tin nhắn `m1` đến B và
+C - Khi B nhận được tin nhắn `m1` của A, B nhắn trả lời cho A và C với tin nhắn `m2`.
+- Tuy nhiên, trong quá trình gửi tin, tin nhắn của A đến C chậm hơn so với tin nhắn
+của B đến C. Lúc này tại C, tin nhắn `m2` sẽ đến trước tin nhắn `m1`.
+
+&rarr; Kết quả tại C là không rõ ràng, C sẽ thấy phản hồi trước khi thấy cả câu hỏi.
 Và C nghĩ rằng B có siêu năng lực nhìn trước tương lai (lol).
 
 Đó là trong trường hợp thực tế, còn trong trường hợp về mặt kĩ thuật, ta giả định như sau:
+
 - `m1` là 1 lệnh tạo ra 1 object trong cơ sở dữ liệu.
 - `m2` là 1 lệnh cập nhật dữ liệu của object đã tạo ở trên.
-- Nếu như `m1` đến sau `m2`, ta sẽ thực hiện lệnh cập nhật, tuy nhiên ta dễ thấy không thể cập nhật 
-một bản ghi trên một object chưa tồn tại. Điều này chỉ có thể thực hiện khi mà `m1` được thực hiện trước `m2` ⇒ Lỗi.
+- Nếu như `m1` đến sau `m2`, ta sẽ thực hiện lệnh cập nhật, tuy nhiên ta dễ thấy không thể cập nhật
+  một bản ghi trên một object chưa tồn tại. Điều này chỉ có thể thực hiện khi mà `m1` được thực hiện trước `m2` ⇒ Lỗi.
 
 Vậy làm thế nào để C biết chính xác được m1 được gửi trước m2, hay nói cách khác là thứ tự của các event.
 
 Ta có các cách giải quyết ban đầu như sau:
+
 ### Sử dụng monotonic clock
+
 Với các thành phần nằm trên cùng một node, ta dễ dàng xử lý vấn đề này. Tuy nhiên, trong hệ thống phân tán,
 các thành phần lại nằm trên các node khác nhau dẫn đến vấn đề vẫn chưa được giải quyết &rarr; Loại
 
 ### Sử dụng time-of-day clock
-Bằng cách gửi kèm timestamp mỗi khi gửi 1 event ⇒ clock synchronization thực hiện bởi Network Time Protocol 
-và các protocol tương tự luôn để lại một vài thứ không chắc chắn về sự sai lệch chính xác giữa 2 clock, 
+
+Bằng cách gửi kèm timestamp mỗi khi gửi 1 event ⇒ clock synchronization thực hiện bởi Network Time Protocol
+và các protocol tương tự luôn để lại một vài thứ không chắc chắn về sự sai lệch chính xác giữa 2 clock,
 đặc biệt là nếu độ trễ mạng theo 2 hướng bất đối xứng. Lấy ví dụ như sau:
+
 - A gửi m1 với timestamp t1 theo clock của A.
-- Khi B nhận được m1 từ A tại thời điểm t2 (tính theo clock của B) với t2 < t1. 
-Dễ thấy clock của A đi trước của B một chút nhưng nếu đúng thì phải là t2 > t1 vì m1 đã được gửi 
-trước khi được nhận ⇒ Vẫn xảy ra khả năng sai thứ tự.
+- Khi B nhận được m1 từ A tại thời điểm t2 (tính theo clock của B) với t2 < t1.
+  Dễ thấy clock của A đi trước của B một chút nhưng nếu đúng thì phải là t2 > t1 vì m1 đã được gửi
+  trước khi được nhận ⇒ Vẫn xảy ra khả năng sai thứ tự.
 
 &rarr; Loại
 
 ## Happens-before relation
+
 Ta quy ước một event là một thứ gì đó xảy ra tại 1 node (gửi hoặc nhận một message, hoặc là 1 bước thực thi ở local).
 
 Ta nói event A xảy ra trước event B ($A → B$) khi nằm ở 1 trong 3 điều kiện sau:
+
 - A và B ở cùng 1 node và thứ tự của A được thực thi trước B ở local.
 - event A là event gửi đi một vài message là m đi, và event B là người nhận được message giống với m.
 - Tồn tại một event C sao cho $A → C$ và $C → B$ (bắc cầu)
 - Mối quan hệ happens-before là một trật tự một phần (partial order): Có thể xảy ra trường hợp cả $A → B$ và $B → A$ đều không đúng. Với trường hợp này, ta gọi A và B là đồng thời ($A || B$)
-<Figure src={happensBeforeExample} alt="">Ví dụ về quan hệ Happens-before</Figure>
-Nhìn vào ảnh trên ta có:
+  <Figure src={happensBeforeExample} alt="">
+    Ví dụ về quan hệ Happens-before
+  </Figure>
+  Nhìn vào ảnh trên ta có:
 - $a → b$, $c → d$, và $e → f$ do cùng nằm trên một node và là thực thi ở local.
 - $b → c$ và $d → f$ do `m1` và `m2`
 - $a → c$, $a → d$, $a → f$, $b → d$, $b → f$, và $c → f$ do tính chất bắc cầu
 - $a || e$, $b || e$, $c || e$, và $d || e$
 
 Mối quan hệ happens-before là một cách lý luận về quan hệ nhân quả trong các hệ thống phân tán.
-Quan hệ nhân quả xem xét liệu thông tin có thể đã truyền từ một event này sang event khác hay không, 
+Quan hệ nhân quả xem xét liệu thông tin có thể đã truyền từ một event này sang event khác hay không,
 và do đó liệu một event có thể đã ảnh hưởng đến event khác hay không.
 
 Quay trở lại với việc sử dụng `time-of-day` clock, sử dụng mối quan hệ happens-before sẽ giải thích được rằng các event
@@ -132,21 +153,25 @@ $ (e_1 \rightarrow e_2) \implies (T(e_1) < T(e_2)) $
 </center>
 
 Trong đó:
+
 - $e_1 \rightarrow e_2$: Đây là một biểu diễn của quan hệ nhân quả giữa hai event e1 và e2, tức là e1 xảy ra trước e2 trong hệ thống
 - $T(e_1) < T(e_2)$: Đây là các dấu thời gian (timestamp) tương ứng của hai event e1 và e2.
 
 Hay nói cách khác: Nếu event e1 dẫn đến event e2 theo quan hệ nhân quả, thì thời gian xảy ra của e1 phải nhỏ hơn thời gian xảy ra của e2.
 
 Ta sẽ tìm hiểu 2 loại Logical clock sau:
+
 - Lamport clock
 - Vector clock
 
 ### Lamport clock
-Ý tưởng chính của Lamport clock là cung cấp một cách sắp xếp các event trong hệ thống phân tán 
-dựa trên thời gian logic, thay vì thời gian vật lý. Trong hệ thống phân tán, 
+
+Ý tưởng chính của Lamport clock là cung cấp một cách sắp xếp các event trong hệ thống phân tán
+dựa trên thời gian logic, thay vì thời gian vật lý. Trong hệ thống phân tán,
 không có đồng hồ chung cho tất cả các máy, vì vậy Lamport clock giúp xác định thứ tự event bằng timestamp ở từng node local.
 
 Thuật toán Lamport clock được mô tả như sau:
+
 ```
 on initialisation do
     t := 0
@@ -167,12 +192,14 @@ end on
 ```
 
 Giải thích:
+
 - Mỗi node duy trì một bộ đếm t và nó được tăng dần 1 đơn vị với mỗi event e xảy ra ở local.
-- L(e) là giá trị của t sau khi tăng lên.
+- $L(e)$ là giá trị của t sau khi tăng lên.
 - Đính kèm t hiện tại cùng với message để gửi ra ngoài network.
 - Node nhận được tăng clock lên nếu timestamp trong message lớn hơn timestamp ở local, sau đó tăng thêm 1.
 
 Ta có các thuộc tính của sơ đồ trên:
+
 - Nếu $a \rightarrow b$ thì $L(a) < L(b)$
 - Tuy nhiên, $L(a) < L(b)$ thì không có nghĩa là $a \rightarrow b$
 - Tồn tại khả năng $L(a) = L(b)$ với $a \neq b$
@@ -180,17 +207,21 @@ Ta có các thuộc tính của sơ đồ trên:
 Nhắc lại ở mối quan hệ happens-before là mối quan hệ trật tự một phần. Khi sử dụng Lamport timestamp, ta có thể mở rộng
 trật tự một phần thành trật tự toàn phần (total order).
 
-<Figure src={lamportClockExample} alt="">Ví dụ về Lamport clock</Figure>
+<Figure src={lamportClockExample} alt="">
+  Ví dụ về Lamport clock
+</Figure>
 
 Tuy nhiên, khi cho 2 Lamport timestamp của 2 event, ta vẫn không thể biết được liệu 2 event đó là đồng thời hay liệu 1 event này đã
 xảy ra trước event kia. Vì vậy, để xác định những event là đồng thời, ta cần 1 loại Logical clock khác là Vector clock.
 
 ### Vector clock
+
 Trong khi Lamport timestamp chỉ sử dụng 1 số nguyên, Vector timestamp lại là một list các số nguyên với mỗi số nguyên
 đại diện cho 1 node trong hệ thống. Theo quy ước, nếu ta đặt n node vào chung 1 vector $<N_1, N_2, ..., N_n>$ thì vector timestamp
 ta thu được sẽ là $<t_1, t_2, ..., t_n>$ với $t_i$ là số lượng event được biết là đã xảy ra tại node $N_i$.
 
 Thuật toán Vector clock được mô tả như sau:
+
 ```
 on initialisation at node Ni do
     T := <0, 0, . . . , 0>
@@ -211,6 +242,7 @@ end on
 ```
 
 Ta có việc xác định thứ tự các event trên Vector clock như sau trong một hệ thống gồm n node:
+
 - $T = T' \iff T[i] = T'[i]$ for all $i \in \{1, \dots, n\}$
 - $T \leq T' \iff T[i] \leq T'[i]$ for all $i \in \{1, \dots, n\}$
 - $T < T' \iff T \leq T'$ and $T \neq T'$
@@ -224,8 +256,9 @@ Thuộc tính của các thứ tự:
 - $(V(a) = V(b)) \iff (a = b)$
 - $(V(a) \parallel V(b)) \iff (a \parallel b)$
 
-
-<Figure src={vectorClockExample} alt="">Ví dụ về Vector clock</Figure>
+<Figure src={vectorClockExample} alt="">
+  Ví dụ về Vector clock
+</Figure>
 
 Ta nói rằng một vector là bé/lớn hơn hoặc bằng một vector khác nếu tất cả các phần tử của vector này bé/lớn hơn tất cả
 các phần tử của vector kia. Một vector được gọi là hoàn toàn bé/lớn hơn một vector khác nếu chúng nhỏ hơn hoặc bằng nhau và
@@ -241,12 +274,12 @@ Vậy ta có thể kết luận rằng Vector clock là clock có thứ tự m�
 Trên đây là tổng hợp thông tin về sự quan trọng của thời gian về thứ tự trong hệ thống phân tán. Giải quyết được
 vấn đề về thứ tự event luôn được đảm bảo trong hệ thống phân tán luôn là một bài toán khó khi có nhiều yếu tố tác động
 dẫn đến sự sai lệch, bất đối xứng thời gian giữa các node với nhau, ... Bên cạnh đó cũng đã có nhiều công trình khác
-được đề xuất bằng cách kết hợp cả Physical lẫn Logical clock (các bạn có thể tìm đọc về Hybrid Logical Clocks 
+được đề xuất bằng cách kết hợp cả Physical lẫn Logical clock (các bạn có thể tìm đọc về Hybrid Logical Clocks
 [tại dây](https://cse.buffalo.edu/~demirbas/publications/hlc.pdf)).
 
 Đây cũng là bài viết mình muốn chia sẻ để có thể làm tiền đề cho những chương mình dự định sẽ viết tiếp theo sau này.
 Ở bài sau, hi vọng mình sẽ làm rõ được sự quan trọng của nó trong giao thức Broadcast.
-Nếu có thắc mắc hay đóng góp nội dung chỉnh sửa, vui lòng liên hệ mình để có thể trao đổi và cập nhật. 
+Nếu có thắc mắc hay đóng góp nội dung chỉnh sửa, vui lòng liên hệ mình để có thể trao đổi và cập nhật.
 Mình rất welcome các bạn ^^.
 
 ## Tham khảo
