@@ -1,0 +1,160 @@
+---
+title: Build một cái K-V DB đơn giản như thế nào? (P1 - Database file format)
+summary: Tìm hiểu cách Bolt DB tổ chức metadata, index và raw data trong file .db duy nhất thông qua hệ thống Page, Meta, Freelist, Branch/Leaf và cơ chế overflow.
+postLayout: column
+date: '2025-08-17'
+draft: false
+cover: '@/assets/build-a-kv-db-p1/pepe.png'
+tags: [database]
+---
+import Figure from "@/components/Figure.astro"
+import dbFileImg from "@/assets/build-a-kv-db-p1/db-file.png"
+import pageImg from "@/assets/build-a-kv-db-p1/page.png"
+import pageHeaderImg from "@/assets/build-a-kv-db-p1/page-header.png"
+import metaPageImg from "@/assets/build-a-kv-db-p1/meta-page.png"
+import freelistPageImg from "@/assets/build-a-kv-db-p1/freelist-page.png"
+import freelistCountImg from "@/assets/build-a-kv-db-p1/freelist-count.png"
+import branchLeafPageImg from "@/assets/build-a-kv-db-p1/branch-leaf-page.png"
+import branchPageImg from "@/assets/build-a-kv-db-p1/branch-page.png"
+import branchPageElementHeaderImg from "@/assets/build-a-kv-db-p1/branch-page-element-header.png"
+import leafPageImg from "@/assets/build-a-kv-db-p1/leaf-page.png"
+import leafPageElementHeaderImg from "@/assets/build-a-kv-db-p1/leaf-page-element-header.png"
+import overflowImg from "@/assets/build-a-kv-db-p1/overflow.png"
+
+Ở phần này, ta chủ yếu quan tâm đến: **cách mà metadata, index và raw data được lưu trữ trên disk**.
+
+Khi ta tạo một một instance Bolt mới thì nó sẽ tạo ra cho chúng ta một file `instance_name.db` . Đây là file sẽ chứa toàn bộ dữ liệu của DB, tức là nó chứa: metadata, index và dữ liệu thô. Khác với những DB khác, Bolt không chia ra thành nhiều file mà nó chỉ sử dụng 1 file duy nhất để quản lý instance, một file .db sẽ chứa toàn bộ các Page như hình minh hoạ ở dưới. Vì vậy Bolt cần có một cách tổ chức dữ liệu phù hợp và hiệu quả.
+
+<Figure src={dbFileImg} alt="Database file structure with pages"></Figure>
+
+## Page
+
+Gồm 2 thành phần cơ bản: header và body
+
+<Figure src={pageImg} alt="Page structure showing header and body"></Figure>
+
+Bolt sử dụng `PAGE_SIZE` của hệ thống để quyết định kích thước của 1 page, việc này nhằm tối ưu khả năng đọc ghi được cung cấp bởi file system. Phân tích header của một page, ta có các field như sau:
+
+<Figure src={pageHeaderImg} alt="Page header structure with fields"></Figure>
+
+| Field | Mô tả |
+|-------|-------|
+| id | page id |
+| flags | Định danh để phân biệt giữa các loại page |
+| count | Ghi lại số lượng phần tử trong page |
+| overflow | Khi gặp dữ liệu lớn không thể vừa trong một page, nó sẽ tràn sang các page khác; overflow ghi lại tổng số lượng page tràn |
+| ptr | Trỏ tới địa chỉ bộ nhớ của dữ liệu page, field này *chỉ tồn tại trong bộ nhớ* |
+
+Xét từng field trong header, với flags, Bolt định nghĩa có 4 loại page trong hệ thống như sau:
+```go
+const (
+    branchPageFlag   = 0x01
+    leafPageFlag     = 0x02
+    metaPageFlag     = 0x04
+    freelistPageFlag = 0x10
+)
+```
+
+Ta sẽ xem xét qua từng loại page một
+
+### Meta Page
+Meta page lưu trữ tất cả metadata của Bolt instance. Cho biết đây là file gì và cách diễn giải file này.
+
+Cấu trúc body của một meta page được định nghĩa như sau:
+
+<Figure src={metaPageImg} alt="Meta page structure"></Figure>
+
+| Field | Mô tả |
+|-------|-------|
+| magic | Một số ngẫu nhiên 32-bit có định được sử dụng để xác định rằng file này là file có số dữ liệu Bolt (khả năng một file khác có cùng dữ liệu ở đầu file aka magic value là cực kỳ thấp). Con số mà Bolt lựa chọn là `0xED0CDAED` (3977042669). |
+| version | Cho biết phiên bản Bolt mà file này thuộc về, thuận tiện cho tương thích và di chuyển trong tương lai |
+| page_size | `PAGE_SIZE` được để cập ở trên |
+| flags | Trường dành riêng, không sử dụng |
+| root | Tất cả index và **raw data** trong instance Bolt được tổ chức thành cấu trúc cây; root là node gốc |
+| freelist | Khi Bolt xóa dữ liệu, có thể xuất hiện không gian thừa; thông tin về không gian này được ghi trong freelist để sử dụng sau |
+| pgid | Id của page tiếp theo sẽ được cấp phát, có giá trị lớn hơn id của tất cả page đã được cấp phát |
+| txid | Id của transaction tiếp theo sẽ được cấp phát. Transaction id tăng đơn điệu và có thể được hiểu là logical time của việc thực thi transaction |
+| checksum | Được sử dụng để xác nhận tính toàn vẹn của dữ liệu meta page, đảm bảo rằng những gì được đọc là dữ liệu từ lần ghi cuối cùng |
+
+Bolt sử dụng magic, version và checksum để xác minh tính hợp lệ của file cơ sở dữ liệu
+```go
+// validate checks the marker bytes and version of the meta page to ensure it matches this binary.
+func (m *meta) validate() error {
+    if m.magic != magic {
+        return ErrInvalid
+    } else if m.version != version {
+        return ErrVersionMismatch
+    } else if m.checksum != 0 && m.checksum != m.sum64() {
+        return ErrChecksum
+    }
+    return nil
+}
+```
+### Freelist Page
+Free list page dùng để quản lý tất cả các page trống do Bolt tạo ra. Được sắp xếp theo 1 list page id nhằm tối ưu khả năng cấp phát không gian cho dữ liệu mới. Ta sẽ tìm hiểu kĩ hơn ở phần Disk Space Manager.
+
+<Figure src={freelistPageImg} alt="Freelist page structure"></Figure>
+
+### Branch/Leaf Page
+Bolt sử dung B+ tree để lưu trữ index và K-V data và coi các branch/leaf page là branch/leaf node luôn. Chúng có chung bố cục nhưng lại khác nhau về element header và data mà nó lưu trữ. Bố cục chung được mô tả như sau:
+
+<Figure src={branchLeafPageImg} alt="Branch and leaf page layout comparison"></Figure>
+
+Sau Page Header là các Element Header, các element này lưu trữ thông tin về data như vị trí và kích thước. Ta có thể thấy, kích thước của các element header là không đổi, vì vậy chỉ cần sắp xếp theo thứ tự. Tuy nhiên với data thì lại khác, vì mỗi data lưu một dữ liệu khác nhau nên không thể có kích thước như nhau được. Việc tổ chức cố định 1 data block sẽ gây ra hiện tượng thiếu/thừa vùng nhớ, vì vậy Bolt sử dụng kĩ thuật Slotted Pages để sắp xếp các data block, dùng element header là chỉ dụng để định danh vị trí của data.
+
+Ta sẽ xem xét chi tiết Branch Page:
+- Lưu trữ dữ liệu của branch node trong B+ tree. Mỗi branch node cần lưu trữ một số key để biểu thị giới hạn trên và dưới của các khoá có trong child node:
+    
+<Figure src={branchPageImg} alt="Branch page detailed structure"></Figure>
+
+- Mở rộng element header, ta có bố cục như sau:
+
+<Figure src={branchPageElementHeaderImg} alt="Branch page element header structure"></Figure>
+
+    | Field | Mô tả |
+    |-------|-------|
+    | pos | Vị trí của khóa aka offset |
+    | ksize | Độ dài của key |
+    | pgid | Page id nơi child node được đặt |
+
+Tiếp theo là Leaf Page:
+- Lưu trữ dữ liệu leaf node của B+ tree. Tức là dữ liệu key-value. Bố cục như sau:
+
+<Figure src={leafPageImg} alt="Leaf page detailed structure"></Figure>
+
+- Ta thấy cũng tương tự như branch page, tuy nhiên ở phần data thì thay vì chỉ là value, lúc này ta có thêm key nữa. Lúc này header sẽ có chút thay đổi như sau:
+
+<Figure src={leafPageElementHeaderImg} alt="Leaf page element header structure"></Figure>
+
+    | Field | Mô tả |
+    |-------|-------|
+    | flags | Đây là trường dành riêng, cũng như để căn chỉnh |
+    | pos | Vị trí của khóa aka offset |
+    | ksize | Độ dài của key |
+    | vsize | Độ dài của value |
+
+Có một điểm nhận ra khác nhau giữa branch page element header và leaf page element header là: Branch page element header có pgid dùng để chỉ định đến page tiếp theo cần visit (hữu ích cho việc navigation). Còn Leaf page element header thì lại không có pgid vì nó đã là endpoint, không có child node để chỉ định đến. Tuy nhiên lại có flags để phân biệt page hiện tại có phải là sub-bucket hay không (cái này ta sẽ tìm hiểu ở phần Bucket).
+
+# Tràn dữ liệu (Data overflow)
+**Vấn đề: Nếu data cần lưu có kích thước to hơn cả một page size thì sao?**
+
+Bolt giải quyết vấn đề này bằng cách sử dụng overflow page. Khi cần lưu trữ dữ liệu vượt quá kích thước của một page, N page liên tiếp đáp ứng yêu cầu kích thước được yêu cầu, trong đó page thứ 2 đến thứ N là overflow của page thứ 1. Chúng chia sẻ page header với page thứ 1:
+
+<Figure src={overflowImg} alt="Data overflow across multiple pages"></Figure>
+
+Những page liên tiếp này được Bolt xem như một page logic khổng lồ, tạo thuận lợi cho logic đọc-ghi thống nhất. Khi ghi overflow page, Bolt sẽ tính toán trước kích thước của toàn bộ page dựa trên page header và element header. Nếu kích thước của nó vượt quá một page, nhiều page liên tiếp được yêu cầu và số lượng overflow page được ghi lại (field này nằm ở page header). Khi đọc, nó cũng được coi như một page logic để đọc vào. Vì các page liên tiếp, dữ liệu liên quan có thể được đọc trực tiếp dựa trên số lượng overflow page được ghi trong page header. Tuy nhiên, một trường hợp đặc biệt cần xem xét cụ thể, đó là ***Freelist page siêu lớn:***
+
+Các phần tử trong freelist page đều là pgid, không có element header và không có thông tin offset dữ liệu. Kích thước của toàn bộ page logic chỉ có thể được xác định thông qua `count` trong page header. Tuy nhiên, có thể có trường hợp độ dài thực tế của freelist vượt quá giới hạn trên của `count(uint16)` là 65535. Bolt xử lý vấn đề này thông qua các giá trị `count`đặc biệt:
+```go
+// If the page.count is at the max uint16 value (64k) then it's considered
+// an overflow and the size of the freelist is stored as the first element.
+idx, count := 0, int(p.count)
+if count == 0xFFFF {
+    idx = 1
+    count = int(((*[maxAllocSize]pgid)(unsafe.Pointer(&p.ptr)))[0])
+}
+```
+Khi count có giá trị chính xác là giá trị giới hạn trên, được coi là 8 byte (uint64) sau page header ghi lại độ dài thực tế của freelist, lúc này page body sẽ bắt đầu sau count chứ không sau page header nữa:
+<Figure src={freelistCountImg} alt="Freelist count overflow handling"></Figure>
+
+File format chỉ là nửa câu chuyện. Dữ liệu được tổ chức đẹp đẽ trên disk cũng vô nghĩa nếu việc đọc/ghi chậm như rùa bò. Vấn đề thực sự là: **làm sao để bridge gap giữa slow disk và fast memory?** Đây chính là challenge mà phần Storage and Cache Management tiếp theo sẽ giải quyết.

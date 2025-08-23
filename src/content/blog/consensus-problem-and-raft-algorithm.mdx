@@ -28,19 +28,6 @@ import raftReplicatedLogSuccessAfterRestart from "@/assets/raft-consensus/raft-r
 
 
 
-
-## Tại sao mình viết cái này
-
-Trong quá trình tìm hiểu của bản thân về hệ thống phân tán. Đặc biệt khi nhìn qua một số công cụ như: Kafka, RabbitMQ, etcd, v.v..
-mình nhận thấy có một vài thứ như sau:
-- Etcd được xây dựng dựa trên thuật toán Raft.
-- Khi quorum queue của rabbitMQ ra đời để thay thế cho classic queue mirroring, nó cũng áp dụng dựa trên thuật toán Raft.
-- Trong [KIP-500](https://cwiki.apache.org/confluence/display/KAFKA/KIP-500%3A+Replace+ZooKeeper+with+a+Self-Managed+Metadata+Quorum) của Kafka
-đề cập đến việc thay thế ZooKeeper sang tự động quản lý, KRaft là thuật toán được chọn để thực hiện điều đó, và nó cũng dựa trên thuật toán Raft.
-
-Quá nhiều thứ liên quan đến thuật toán Raft ở đây, vậy nên mình bắt đầu tìm hiểu bài toán đồng thuận cũng như Raft nó là cái gì. Liệu nó có phải là cái trò chơi
-hồi bé mình hay chơi không (lol).
-
 ## Bài toán đồng thuận
 ### Bài toán các vị tướng Byzantine (Byzantine generals problem)
 Một bài toán lý thuyết trò chơi được mô tả như sau:
