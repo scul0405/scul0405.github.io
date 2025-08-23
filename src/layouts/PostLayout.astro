@@ -11,6 +11,7 @@ import ScrollTopAndComments from "@/solid/ScrollTopAndComments.tsx";
 import PostCover from "../components/PostCover.astro";
 import DetailsSummary from "../components/DetailsSummary.astro";
 import SocialShareButtons from "../components/social-icons/SocialShareButtons.astro";
+import PostNavigation from "../components/PostNavigation.astro";
 import { POST_METADATA } from "@/consts";
 import { useTranslations } from "@/i18n";
 import avatar from "../assets/avatar.jpg";
@@ -138,6 +139,9 @@ const { Content, headings } = await post.render();
                 <SocialShareButtons title={post.data.title} description={post.data.summary} />
               ) : null
             }
+            
+            <PostNavigation {next} {prev} />
+            
             <!--    <div class="pb-6 pt-6 text-sm text-gray-700 dark:text-gray-300">-->
             <!--        <Link href={discussUrl(path)} rel="nofollow">-->
             <!--            Discuss on Twitter-->
