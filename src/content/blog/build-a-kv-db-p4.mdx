@@ -128,6 +128,7 @@ Giả sử người dùng tiếp tục tạo thêm bucket giống như b1, cho �
 
 Cần lưu ý rằng mặc dù dữ liệu trong mỗi bucket là  B+ Tree hợp lệ, nhưng cây mà chúng cùng nhau tạo thành thường không phải là  B+ Tree.
 
+## Kết
 Bucket System giải quyết được việc tổ chức dữ liệu thành các namespace riêng biệt. Nhưng khi đã có data được group gọn gàng trong các buckets, một thách thức mới xuất hiện: **làm sao để traverse qua nhiều K-V pairs một cách hiệu quả?**
 
 Đây chính là lúc **Cursor** ra đời - một iterator cho phép navigate qua B+ Tree một cách hiệu quả. Ta sẽ tìm hiểu nó ở phần sau.

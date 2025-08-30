@@ -150,6 +150,7 @@ Xét ví dụ tìm kiếm key `"V"` với init state như sau:
 
 Ta tốn `log(C)` cho mỗi lần tìm kiếm key ở từng node, ta cần duyệt qua `log(N)` node như vậy để từ root có thể xuống tới leaf node. Vậy độ phức tạp thời gian của toàn bộ quá trình tìm kiếm sẽ là `O(log(C)log(N))`.
 
+## Kết
 Vậy là ta đã tìm hiểu được cách thức hoạt động của Cursor. Cursor cho phép ta navigate qua data một cách hiệu quả, có thể scan ranges, iterate qua keys theo thứ tự... Nhưng điều gì xảy ra khi có **nhiều operations đồng thời** trên cùng một database? Ví dụ: một goroutine đang đọc data qua cursor, trong khi goroutine khác đang update/delete keys?
 
 Nếu không có mechanism nào kiểm soát, ta sẽ gặp những vấn đề kinh điển: **dirty reads, inconsistent data, race conditions**. Đây chính là lúc **Transaction System** trở nên cực kỳ quan trọng. Và tất nhiên rồi, hẹn bài sau nhé hihi.

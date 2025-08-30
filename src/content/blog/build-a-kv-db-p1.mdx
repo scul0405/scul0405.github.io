@@ -157,4 +157,5 @@ if count == 0xFFFF {
 Khi count có giá trị chính xác là giá trị giới hạn trên, được coi là 8 byte (uint64) sau page header ghi lại độ dài thực tế của freelist, lúc này page body sẽ bắt đầu sau count chứ không sau page header nữa:
 <Figure src={freelistCountImg} alt="Freelist count overflow handling"></Figure>
 
+## Kết
 File format chỉ là nửa câu chuyện. Dữ liệu được tổ chức đẹp đẽ trên disk cũng vô nghĩa nếu việc đọc/ghi chậm như rùa bò. Vấn đề thực sự là: **làm sao để bridge gap giữa slow disk và fast memory?** Đây chính là challenge mà phần Storage and Cache Management tiếp theo sẽ giải quyết.

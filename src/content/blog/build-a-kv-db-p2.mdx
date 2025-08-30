@@ -16,7 +16,7 @@ import mmap from "@/assets/build-a-kv-db-p2/mmap.png"
 ## Disk space manager
 Không như các DB lớn khác có khả năng shrinking (Postgres hay SQLite có `VACUMM`, MySQL có `OPTIMIZE TABLE`). Bolt DB sau khi yêu cầu disk space từ OS thì dù cho có xoá dữ liệu đi nó cũng không trả lại disk space thừa cho OS. Lý do cho điều này là ý tưởng của LMDB là giảm thiểu system call và disk operator. Trade off cho việc này là bộ nhớ. Do đó, Bolt sử dụng Free page để quản lý các page trống. Vì vậy việc tổ chức Heap File để quản lý disk space chính là freelist đã đề cập ở bài trước.
 
-Freelist chịu trách nhiệm quản lý việc cấp phát và thu hồi các page trống. Khi các transaction đọc-ghi yêu cầu disk space, freelist luôn cố gắng tìm một disk space liên tiếp về mặt vật lý đáp ứng kích thước cần thiết trước. Nếu tìm thấy thì cấp phát trực tiếp; nếu không thì yêu cầu disk space mới từ hệ điều hành. Ta sẽ quay lại tiếp tục tìm hiểu nó ở `DB Layer` để xem việc cấp phát diễn ra cụ thể như thế nào.
+Freelist chịu trách nhiệm quản lý việc cấp phát và thu hồi các page trống. Khi các read-write transaction yêu cầu disk space, freelist luôn cố gắng tìm một disk space liên tiếp về mặt vật lý đáp ứng kích thước cần thiết trước. Nếu tìm thấy thì cấp phát trực tiếp; nếu không thì yêu cầu disk space mới từ hệ điều hành. Ta sẽ quay lại tiếp tục tìm hiểu nó ở `DB Layer` để xem việc cấp phát diễn ra cụ thể như thế nào.
 
 ### Cấu trúc
 Cấu trúc của freelist như sau:
@@ -35,12 +35,12 @@ Freelist lưu các page id trống vào ids và được sắp xếp tuần tự
 
 
 ### Vì sao cần pending page và chiến lược cấp phát của freelist:
-Khi gặp việc xóa dữ liệu, các transaction đọc-ghi sẽ giải phóng disk space thừa trở lại freelist. Lúc này, freelist sẽ không ngay lập tức cấp phát lại mà sẽ đánh dấu những page được giải phóng này là trạng thái pending (pending page), cho đến khi không có transaction đọc nào trong hệ thống phụ thuộc vào dữ liệu cũ trong những page này, thì mới chính thức thu hồi và tái cấp phát. Kịch bản ví dụ như sau:
+Khi gặp việc xóa dữ liệu, các read-write transaction sẽ giải phóng disk space thừa trở lại freelist. Lúc này, freelist sẽ không ngay lập tức cấp phát lại mà sẽ đánh dấu những page được giải phóng này là trạng thái pending (pending page), cho đến khi không có transaction đọc nào trong hệ thống phụ thuộc vào dữ liệu cũ trong những page này, thì mới chính thức thu hồi và tái cấp phát. Kịch bản ví dụ như sau:
 <Figure src={transaction} alt="Transaction example"></Figure>
 
-- Transaction chỉ đọc (read-only) B đang chạy. Lúc này, transaction đọc-ghi A xóa một phần dữ liệu khỏi cơ sở dữ liệu và giải phóng disk space tương ứng trở lại freelist.
+- Read-only ransaction B đang chạy. Lúc này, read-write transaction A xóa một phần dữ liệu khỏi cơ sở dữ liệu và giải phóng disk space tương ứng trở lại freelist.
 
-- Nếu lúc này freelist ngay lập tức cấp phát những page vừa được giải phóng cho transaction đọc-ghi C tiếp theo, transaction sau có thể thay đổi chúng và persist xuống đĩa. Trong quá trình này, transaction read-only B vẫn đang đọc dữ liệu và có thể đọc các phiên bản khác nhau của cùng một dữ liệu &rarr; Vi phạm `isolation`, có thể gây ra hiện tượng `Non-repeatable read` hoặc `Phantom read`.
+- Nếu lúc này freelist ngay lập tức cấp phát những page vừa được giải phóng cho read-write transaction C tiếp theo, transaction sau có thể thay đổi chúng và persist xuống đĩa. Trong quá trình này, transaction read-only B vẫn đang đọc dữ liệu và có thể đọc các phiên bản khác nhau của cùng một dữ liệu &rarr; Vi phạm `isolation`, có thể gây ra hiện tượng `Non-repeatable read` hoặc `Phantom read`.
 
 - Vì vậy, Bolt triển khai thực tế bằng cách: khi transaction A giải phóng disk space, freelist chỉ đánh dấu nó là trạng thái `pending`, chờ các transaction như B vẫn phụ thuộc vào những page này hoàn thành thực thi trước khi thu hồi và tái sử dụng, từ đó tránh data inconsistency và đảm bảo transaction isolation. Chiến lược giải phóng này đặc biệt quan trọng trong việc thực hiện kiểm soát đồng thời `đa phiên bản cơ sở dữ liệu (Multi-version concurrency control)`. Chúng ta sẽ tiếp tục thảo luận chủ đề này trong phần `Transaction`.
 
@@ -145,7 +145,7 @@ func (db *DB) page(id pgid) *page {
 ```
 
 ### Write Buffer Pool
-Đối với writes, Bolt từ bỏ write buffering phức tạp để ủng hộ chiến lược đơn giản nhưng hiệu quả: Khi các giao dịch đọc-ghi commit, tất cả dirty page sẽ được persist xuống đĩa. Trước khi persist, Bolt sắp xếp những page này theo thứ tự tăng dần của page id, sau đó ghi chúng xuống đĩa theo thứ tự. Vì tất cả page trong file cơ sở dữ liệu được sắp xếp theo thứ tự tăng dần của id và kề nhau, việc ghi ra như vậy là ghi tuần tự, rất thân thiện với thiết bị lưu trữ khối.
+Đối với writes, Bolt từ bỏ write buffering phức tạp để ủng hộ chiến lược đơn giản nhưng hiệu quả: Khi các read-write transaction commit, tất cả dirty page sẽ được persist xuống đĩa. Trước khi persist, Bolt sắp xếp những page này theo thứ tự tăng dần của page id, sau đó ghi chúng xuống đĩa theo thứ tự. Vì tất cả page trong file cơ sở dữ liệu được sắp xếp theo thứ tự tăng dần của id và kề nhau, việc ghi ra như vậy là ghi tuần tự, rất thân thiện với thiết bị lưu trữ khối.
 ```go
 func (tx *Tx) write() error {
     // Sắp xếp pages theo ID để ghi tuần tự
@@ -162,6 +162,7 @@ func (tx *Tx) write() error {
 }
 ```
 
+## Kết
 Vậy là xong, ta đã tìm hiểu được thêm phần quản lý bộ nhớ cũng như cách Bolt sử dụng OS mmap như nào. Nhưng đó mới chỉ là "raw materials". Vấn đề thực sự là: **khi application muốn lấy value từ một key, làm sao Bolt biết chính xác key đó nằm ở page nào thay vì scan toàn bộ database?**
 
 Đây chính là lúc ta cần một data structure thông minh để tổ chức và tìm kiếm key-value pairs hiệu quả - và đó chính là **Data Structure** ở phần tiếp theo.

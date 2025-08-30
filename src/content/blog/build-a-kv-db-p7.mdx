@@ -1,0 +1,365 @@
+---
+title: Build một cái K-V Database đơn giản như thế nào? (P7 - Database Layer)
+summary: Khám phá Database Layer - lớp orchestrator chính của Bolt, kết nối tất cả components và cung cấp unified API cho developers
+postLayout: column
+date: '2025-08-29'
+draft: false
+cover: '@/assets/build-a-kv-db-p1/pepe.png'
+tags: [database]
+---
+
+import Figure from "@/components/Figure.astro"
+import dataAccessArch from "@/assets/build-a-kv-db-p7/data-access-architect.png"
+
+Sau 6 phần, chúng ta đã tìm hiểu về các building blocks của Bolt: file format, storage management, B+ tree, buckets, cursors và transactions. Nhưng làm sao tất cả những components này `"dính"` lại với nhau thành một database hoàn chỉnh? Câu trả lời chính là **DB Layer** - lớp orchestrator cao nhất chịu trách nhiệm quản lý lifecycle, cung cấp API, và đảm bảo tính nhất quán của toàn bộ hệ thống.
+
+Phần này sẽ chủ yếu nói về code được expose ở Database Layer, vì chỉ có code mới biết nó kết hợp các component nào.
+
+## DB Structure - The Central Coordinator
+DB struct trong Bolt chứa tất cả những gì cần thiết để quản lý một database instance:
+
+```go
+type DB struct {
+    // Configuration & behavior
+    StrictMode    bool
+    NoSync        bool    // Skip fsync for performance
+    ReadOnly      bool    // Read-only access mode
+
+    // File system integration
+    path         string   // Database file path
+    file         *os.File // File handle
+
+    // Memory management
+    data         *[maxMapSize]byte // mmap array
+    datasz       int               // Current mapped size
+    pageSize     int               // Page size alignment
+
+    // Core components
+    meta0        *meta      // Primary metadata
+    meta1        *meta      // Backup metadata
+    freelist     *freelist  // Free page management
+
+    // Transaction coordination
+    rwtx         *Tx        // Current read-write transaction
+    txs          []*Tx      // Active read-only transactions
+
+    // Concurrency control
+    rwlock       sync.Mutex   // Single writer enforcement
+    mmaplock     sync.RWMutex // Memory mapping protection
+
+    // Performance optimization
+    batch        *batch       // Batch operation context
+    batchMu      sync.Mutex   // Batch coordination
+    pagePool     sync.Pool    // Page buffer recycling
+}
+```
+
+DB struct có 4 trách nhiệm chính:
+- **File Management:** Quản lý file system operations, file locking, permissions
+- **Memory Mapping:** Điều phối memory-mapped access, remapping khi cần
+- **Transaction Coordination:** Thực thi single-writer rule, quản lý MVCC
+- **Component Orchestration:** Kết nối freelist, meta pages, B+ trees, buckets
+
+## Database Lifecycle - Open và Close
+
+### Mở một Database
+Việc mở một database Bolt không chỉ đơn giản là mở file. Đây là một quá trình phức tạp gồm nhiều bước quan trọng:
+```go
+func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
+    db := &DB{opened: true}
+
+    // 1. File system setup
+    if err := db.open(path, mode, options); err != nil {
+        return nil, err
+    }
+
+    // 2. Memory mapping initialization
+    if err := db.mmap(options.InitialMmapSize); err != nil {
+        return nil, err
+    }
+
+    // 3. Load or initialize metadata
+    if fileSize == 0 {
+        if err := db.init(); err != nil {  // New database
+            return nil, err
+        }
+    }
+
+    // 4. Restore freelist state
+    db.freelist = newFreelist()
+    db.freelist.read(db.page(db.meta().freelist))
+
+    return db, nil
+}
+```
+
+Tại bước 3, ta nhận thấy Bolt có 2 trường hợp xảy ra là load database đã có hoặc init một database mới.
+
+Với tạo database mới, Bolt phải setup initial state:
+- Tạo 2 meta pages (cho redundancy)
+- Khởi tạo root bucket
+- Setup initial freelist
+- Ghi tất cả mọi thứ vào disk
+
+Với mở database có sẵn:
+- Validate file format và compatibility
+- Load metadata pages
+- Restore freelist state
+- Xác minh toàn vẹn dữ liệu của database.
+
+### Closing và Cleanup
+Quá trình đóng database đảm bảo không mất dữ liệu và cleanup resources:
+- Transaction Completion: Chờ tất cả active transactions hoàn thành hoặc timeout
+- Memory Unmapping: Giải phóng memory-mapped regions một cách an toàn
+- File Handle Cleanup: Đóng file descriptors và release OS locks
+```go
+func (db *DB) Close() error {
+    // 1. Wait for all transactions to complete
+    db.metalock.Lock()
+    defer db.metalock.Unlock()
+
+    // 2. Unmap memory
+    if err := db.munmap(); err != nil {
+        return err
+    }
+
+    // 3. Close file handles
+    return db.file.Close()
+}
+```
+
+## API Layer - Giao diện người dùng
+Bolt cung cấp 3 cách tương tác khác nhau, mỗi cách phù hợp với use case riêng:
+
+### Managed Transactions - Đơn Giản và An Toàn
+Các transaction được quản lý sẵn đã được cài sẵn các hàm xử lý khi gặp vấn đề:
+- Transaction lifecycle (begin, commit, rollback)
+- Error handling và cleanup
+- Panic recovery
+- Resource management
+```go
+// Read-write transaction
+err := db.Update(func(tx *bolt.Tx) error {
+    b := tx.Bucket([]byte("MyBucket"))
+    return b.Put([]byte("key"), []byte("value"))
+})
+
+// Read-only transaction
+err := db.View(func(tx *bolt.Tx) error {
+    b := tx.Bucket([]byte("MyBucket"))
+    val := b.Get([]byte("key"))
+    fmt.Printf("Value: %s\n", val)
+    return nil
+})
+```
+
+### Explicit Transactions - Kiểm Soát Hoàn Toàn
+Như đã đề cập ở chương `Transaction` explicit transactions cho phép ta hoàn toàn tự kiểm soát transaction như sau:
+```go
+// Manual transaction management
+tx, err := db.Begin(true) // read-write
+if err != nil {
+    return err
+}
+defer tx.Rollback() // Safety net
+
+// Do work...
+b := tx.Bucket([]byte("MyBucket"))
+err = b.Put([]byte("key"), []byte("value"))
+if err != nil {
+    return err // tx.Rollback() called by defer
+}
+
+return tx.Commit() // Success
+```
+
+### Batch Operations
+Bolt cũng cung cấp Batch operations để tối ưu write throughput bằng cách kết hợp nhiều operations:
+
+```go
+err := db.Batch(func(tx *bolt.Tx) error {
+    b := tx.Bucket([]byte("MyBucket"))
+    for i := 0; i < 1000; i++ {
+        key := fmt.Sprintf("key%d", i)
+        val := fmt.Sprintf("value%d", i)
+        if err := b.Put([]byte(key), []byte(val)); err != nil {
+            return err
+        }
+    }
+    return nil
+})
+```
+
+**Batch intelligence:** Nếu nhiều goroutines gọi `Batch()` đồng thời, Bolt sẽ kết hợp chúng thành một transaction bự để tối ưu performance.
+
+## Component Orchestration - Making It All Work
+Database Layer phải điều phối tất cả các thành phần một cách cẩn thận:
+
+### MVCC Coordination
+Database Layer đảm bảo mỗi transaction đều có góc nhìn nhất quán với nhau:
+- Transaction Isolation: Mỗi transaction capture metadata snapshot tại thời điểm bắt đầu, đảm bảo duy trì góc nhìn nhất quán khi đọc dữ liệu suốt vòng đời transaction.
+- Snapshot versioning: Database duy trì nhiều phiên bản metadata khác nhau để hỗ trợ đồng thời nhiều reader trong khi writer đang cập nhật cấu trúc.
+```go
+func (db *DB) beginTx() (*Tx, error) {
+    // 1. Create transaction with current metadata snapshot
+    t := &Tx{
+        db:   db,
+        meta: db.meta(), // Snapshot at transaction start
+    }
+
+    // 2. Add to active transaction list
+    db.txs = append(db.txs, t)
+
+    return t, nil
+}
+```
+
+### Memory Management Coordination
+Database Layer quản lý memory mapping và page allocation như sau:
+
+```go
+func (db *DB) allocate(count int) (*page, error) {
+    // 1. Try to get pages from freelist first
+    if p := db.freelist.allocate(count); p != nil {
+        return p, nil
+    }
+
+    // 2. Need to grow database file
+    if err := db.grow(count * db.pageSize); err != nil {
+        return nil, err
+    }
+
+    // 3. Possibly need to remap memory
+    if db.datasz < db.filesz {
+        if err := db.mmap(0); err != nil {
+            return nil, err
+        }
+    }
+
+    // 4. Allocate from end of file
+    return db.allocateAt(db.meta().pgid, count), nil
+}
+```
+
+### Freelist Coordination
+Freelist management requires careful coordination với transactions:
+
+```go
+func (db *DB) freepages(txid txid, pages []pgid) {
+    // Pages can't be immediately freed - other transactions
+    // might still be reading them. Mark as pending.
+    db.freelist.free(txid, pages)
+}
+
+func (db *DB) releasePages() {
+    // Find oldest active transaction
+    minTxid := db.oldestActiveTransaction()
+
+    // Release pages from transactions older than minTxid
+    db.freelist.release(minTxid)
+}
+```
+
+## Concurrency Control
+
+Database Layer đảm bảo tuân thủ concurrency rules:
+
+### Single Writer Pattern
+
+```go
+func (db *DB) beginRWTx() (*Tx, error) {
+    // Only one read-write transaction allowed
+    db.rwlock.Lock() // Will be released on tx.Commit() or tx.Rollback()
+
+    t := &Tx{
+        db:       db,
+        writable: true,
+        meta:     db.meta().copy(), // Private metadata copy
+    }
+
+    db.rwtx = t
+    return t, nil
+}
+```
+
+### Multiple Readers
+
+```go
+func (db *DB) beginTx() (*Tx, error) {
+    // Multiple readers allowed, no locking needed
+    // MVCC provides isolation
+
+    t := &Tx{
+        db:       db,
+        writable: false,
+        meta:     db.meta(), // Shared metadata snapshot
+    }
+
+    // Add to active transactions list
+    db.metalock.Lock()
+    db.txs = append(db.txs, t)
+    db.metalock.Unlock()
+
+    return t, nil
+}
+```
+
+## Kết hợp tất cả mọi thứ
+Hãy xem một ví dụ hoàn chỉnh về cách mà Database Layer điều phối tất cả các thành phần:
+
+```go
+// User code
+err := db.Update(func(tx *bolt.Tx) error {
+    bucket, err := tx.CreateBucketIfNotExists([]byte("users"))
+    if err != nil {
+        return err
+    }
+
+    return bucket.Put([]byte("john"), []byte(`{"name":"John","age":30}`))
+})
+```
+
+**Behind the scenes:**
+1. **DB Layer** bắt đầu một managed transaction
+2. **Transaction Layer** acquire rwlock, tạo MVCC snapshot
+3. **Bucket Layer** tìm hoặc tạo bucket trong B+ Tree
+4. **Storage Layer** allocate pages nếu cần (qua freelist)
+5. **Data Structure** cập nhật B+ tree nodes
+6. **Transaction Layer** thu thập các dirty page
+7. **DB Layer** điều phối quá trình commit
+8. **Storage Layer** ghi các page vào disk theo thứ tự được sắp xếp
+9. **DB Layer** sync dữ liệu từ application vào disk
+10. **Transaction Layer** release rwlock
+
+Quy trình được mô tả chung theo kiến trúc sau:
+<Figure src={dataAccessArch} alt="Data access architecture"></Figure>
+
+
+## Kết - Hành trình tìm 7 viên ngọc rồng kết thúc
+Qua 7 phần, chúng ta đã hoàn thành cuộc hành trình khám phá Bolt DB và cách tạo ra một K-V Database đơn giản từ A tới Á:
+- **P1 - Database File Format:** Foundation - cách tổ chức metadata, index và raw data trong một file trên disk
+- **P2 - Storage and Cache Management:** Memory management với mmap và freelist cho disk space
+- **P3 - Data Structure:** Triển khai B+ Tree với cơ chế rebalance/spill
+- **P4 - Bucket:** Quản lý các namespace cùng với kĩ thuật inline-bucket để tối ưu disk space.
+- **P5 - Cursor:** Truy cập dữ liệu hiệu quả và iteration patterns
+- **P6 - Transaction:** Tuân thủ ACID, MVCC và concurrency control
+- **P7 - Database Layer:** Điều phối tất cả các thành phần thành một cái Database system hoàn chỉnh
+
+### Một vài điểm chính
+
+**Đơn giản mà tinh tế:** Bolt cung cấp các API đơn giản nhưng đằng sau là các kĩ thuật tinh tế. Single file format, coarse-grained locking và OS page cache delegation tạo ra một giải pháp đủ xịn để giải quyết các vấn đề.
+
+**Kĩ thuật tích hợp các thành phần:** Mỗi thành phần có trách nhiệm rõ ràng nhưng lại hoạt động cùng nhau 1 cách mướt mườn mượt.
+
+**Hiệu suất thông qua cách thiết kế:** Bolt đạt được gud performance không qua micro-optimizations mà qua cách lựa chọn kĩ thuật: memory mapping, sequential I/O, batch operations và zero-copy access.
+
+**ACID thông qua sự phối hợp:** Các thuộc tính này của Transaction đạt được từ sự phối hợp giữa các phần: freelist cho isolation, dual metadata cho durability, single-writer cho consistency.
+
+
+Cuối cùng, việc mình tìm hiểu sâu vào trong hệ thống để:
+- Đưa ra quyết định có căn cứ khi chọn cơ sở dữ liệu
+- Debug mấy cái vấn đề về hiệu suất một cách hiệu quả
+- Làm cái gì cũng có trade-off, nhưng biết chọn đánh đổi nào là phù hợp
+- Thiết kế hệ thống tốt hơn lấy cảm hứng từ mấy cái đã được cải tiến và chứng minh
+
+Gud job Bolt - một masterclass trong việc cân bằng các trade-off.

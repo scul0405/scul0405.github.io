@@ -1,0 +1,190 @@
+---
+title: Build một cái K-V Database đơn giản như thế nào? (P6 - Transaction)
+summary: Tìm hiểu về Transaction System trong Bolt DB - cơ chế ACID, MVCC, concurrency control và serializable isolation để đảm bảo tính nhất quán dữ liệu
+postLayout: column
+date: '2025-08-27'
+draft: false
+cover: '@/assets/build-a-kv-db-p1/pepe.png'
+tags: [database]
+---
+
+import Figure from "@/components/Figure.astro"
+import txExample1 from "@/assets/build-a-kv-db-p6/tx-example-1.png"
+import txExample2 from "@/assets/build-a-kv-db-p6/tx-example-2.png"
+
+
+`Transaction` là một lớp trừu tượng mà cơ sở dữ liệu cung cấp cho ứng dụng. Lớp trừu tượng này ẩn đi tất cả thông tin kiểm soát đồng thời (Concurrency Control) và các software/hardware exception khác nhau, chỉ để lộ hai trạng thái cho ứng dụng: thành công (`commit`) và huỷ bỏ (`abort`).
+
+Các thay đổi dữ liệu trong read-write transaction hoặc được thực thi hoàn toàn hoặc được rollback về trạng thái trước khi thay đổi, không tồn tại trạng thái trung gian thực thi một nửa.
+
+Với sự hỗ trợ của transaction, ứng dụng có thể retry theo nhu cầu khi gặp lỗi thực thi. Transaction của Bolt cung cấp khả năng serializable, tuân thủ ACID.
+
+## Concurrency Control
+Bolt chỉ cho phép một read-write transaction duy nhất thực thi đồng thời. Tuy nhiên, trong quá trình sử dụng, các process khác nhau có thể truy cập cùng một database file, và một process duy nhất cũng có thể mở nhiều transaction đồng thời. Do đó, Bolt cần thực hiện kiểm soát đồng thời tương ứng cả ở cấp độ database file và cấp độ database instance riêng lẻ.
+
+### Database File: flock
+`flock` là khóa được cung cấp bởi hệ điều hành dựa trên `file descriptor`, hỗ trợ cả `shared mode` và `exclusive mode`. Vì mỗi instance Bolt tương ứng với một file độc lập, flock trở thành lựa chọn đầu tiên cho kiểm soát đồng thời ở cấp độ database file.
+
+Logic khóa tương ứng như sau:
+```go
+func flock(db *DB, mode os.FileMode, exclusive bool, timeout time.Duration) error {
+	// ...
+  flag := syscall.LOCK_SH  // shared
+  if exclusive {
+    flag = syscall.LOCK_EX // exclusive
+  }
+
+  err := syscall.Flock(int(db.file.Fd()), flag|syscall.LOCK_NB)
+  // ...
+}
+```
+
+Nếu ta chọn mở instance Bolt ở read-only mode:
+```go
+db, err := bolt.Open("1.db", 0600, &bolt.Options{ReadOnly: true})
+```
+
+Instance Bolt sẽ lấy shared lock của `1.db`. Nếu ta mở ở mode non-read-only, nó sẽ lấy exclusive lock của `1.db`. Điều này làm cho không thể có quá một process mở file cơ sở dữ liệu ở chế độ non-read-only, từ đó ta thực hiện được việc kiểm soát đồng thời ở cấp độ file.
+
+### Database Instance: DB.rwlock
+Mỗi instance Bolt có một `rwlock` (sử dụng `sync` package) để đảm bảo rằng tối đa chỉ có một read-write transaction thực thi đồng thời. Logic tương ứng nằm trong logic con DB.beginRWTx của `Begin` của mỗi read-write transaction:
+```go
+func (db *DB) beginRWTx() (*Tx, error) {
+	// ...
+
+	// Obtain writer lock. This is released by the transaction when it closes.
+	// This enforces only one writer transaction at a time.
+	db.rwlock.Lock()
+
+    // ...
+}
+```
+
+[//]: # (### Bottlenecks: Cơ chế Coarse-grained Concurrency Control)
+
+[//]: # (Bolt sử dụng `coarse-grained concurrency control` vì một số lý do thiết kế và triết lý cụ thể mà chúng ta đã thảo luận ở phần trước. Điều này có nghĩa là ngay cả khi các transaction khác nhau đọc và ghi dữ liệu hoàn toàn không liên quan đến nhau, chỉ cần có một transaction đang đọc bất kỳ dữ liệu nào từ toàn bộ database file, thì các transaction khác sẽ không thể ghi dữ liệu vào database.)
+
+[//]: # ()
+[//]: # (Điều này dẫn đến một số hạn chế quan trọng trong thực tế:)
+
+[//]: # (- Thời gian thực thi phải được kiểm soát chặt chẽ. Mỗi read-write transaction không nên kéo dài quá lâu, vì nó sẽ block toàn bộ các write operation khác. Nếu bạn có một transaction đọc dữ liệu trong 5 giây, thì trong suốt thời gian đó, không có transaction nào khác có thể ghi dữ liệu vào database.)
+
+[//]: # (- Khối lượng dữ liệu cần được hạn chế. Việc xử lý khối lượng dữ liệu lớn trong một transaction sẽ làm tăng thời gian thực thi, gián tiếp ảnh hưởng đến concurrent performance của toàn bộ hệ thống.)
+
+[//]: # (- Không phù hợp với `high-throughput write scenarios`: Trong những tình huống cần xử lý nhiều write operation đồng thời với tần suất cao, Bolt có thể trở thành bottleneck. Các hệ thống cần hỗ trợ fine-grained concurrency control - như khóa ở mức namespace hoặc key level - sẽ không tìm thấy sự phù hợp trong BoltDB.)
+
+## Quá trình thực thi
+Các transaction được Bolt hỗ trợ được chia thành:
+- `read-only transaction` và `read-write transaction` dựa trên việc có thay đổi dữ liệu hay không.
+- `Implicit transaction` và `explicit transaction` dựa trên ai quản lý vòng đời transaction.
+
+Trong implicit transaction, Bolt chịu trách nhiệm quản lý vòng đời transaction, chẳng hạn như khởi tạo, thực thi, đóng và rollback transaction. Do đó người dùng chỉ cần quan tâm đến logic truy cập dữ liệu `fn`.
+
+Trong explicit transaction, người dùng cần tự quản lý việc cấp phát và thu hồi tài nguyên liên quan. Một quá trình thực thi explicit transaction điển hình như sau:
+```go
+func Explicit(db *DB, fn func(*Tx) error) error {
+  t := db.Begin(true)
+  // ...
+  err := fn(t) // logic truy cập dữ liệu
+  if err != nil {
+    t.Rollback()
+    return err
+  }
+  return t.Commit()
+}
+```
+
+Quá trình của một transaction diễn ra như sau:
+- Khởi tạo một transaction:
+    - Lock meta page.
+    - Acquire read lock cho mmap để khi mmap được remapped, nó sẽ acquire write lock -> Đợi tất cả các transaction hoàn tất (release RLock) mới thực hiện remapped.
+    - Tạo mới một transaction.
+    - Cập nhật txid vào meta page, sau đó release lock meta page.
+- Thực hiện logic chính.
+- Commit sau khi thực hiện xong (chỉ xảy ra với read-write transaction, read-only không cần):
+    - Thực hiện rebalance root bucket.
+    - Spill tất cả data vào dirty page.
+    - Free root bucket cũ.
+    - Thực hiện ghi dirty page vào disk.
+    - Thực hiện ghi meta page vào disk.
+    - Close transaction, thực thi các hàm sau khi transaction kết thúc (nếu có).
+- Trong quá trình thực hiện, nếu có bất kì lỗi nào xảy ra (do hệ thống hoặc do user tự gọi Rollback). Nó sẽ thực hiện:
+    - Rollback các freelist của DB.
+    - Reload lại freelist cho DB đó.
+
+## ACID Properties
+- `Tính nguyên tử (Atomicity)`: Một read-write transaction duy nhất hoặc thực thi thành công hoặc rollback hoàn toàn
+- `Tính nhất quán (Consistency)`: Miễn là chương trình sử dụng transaction một cách chính xác và hợp lý để thao tác dữ liệu, Bolt đảm bảo `atomicity` và `serializable isolation levels`, điều này đảm bảo tính nhất quán
+- `Tính cô lập (Isolation)`: Bolt chỉ cho phép một read-write transaction thực thi đồng thời; tất cả read-write transaction chỉ có thể thực thi tuần tự, thỏa mãn `serializable isolation levels`
+- `Tính bền vững (Durability)`: Mỗi khi read-write transaction thực thi `t.Commit()` để commit, dirty data sẽ được ghi vào disk (trừ khi NoSync được kích hoạt thủ công). Nếu persist thất bại thì rollback. Do đó, khi thực thi transaction trả về mà không có lỗi, dữ liệu đã được persist.
+
+Chú ý rằng, khi khởi tạo một Database, nó luôn tạo ra 2 meta page nhằm thực thi cơ chế chịu lỗi: nếu một giao dịch bị crash trong quá trình persist meta page xuống đĩa, dữ liệu trên đĩa có thể ở trạng thái không chính xác, khiến file cơ sở dữ liệu không sử dụng được. Vậy nên Bolt chuẩn bị hai meta page, tạm gọi là A và B. Nếu lần trước ghi A, lần này sẽ ghi B, và ngược lại. Điều này đảm bảo rằng khi đọc file cơ sở dữ liệu và phát hiện một meta page không hợp lệ, dữ liệu có thể được khôi phục ngay lập tức về trạng thái được ghi bởi meta page khác.
+
+Làm thế nào để khôi phục về trạng thái trước? Cách tiếp cận của Bolt rất ngắn gọn: tất cả dữ liệu được cập nhật đều được ghi vào page mới, đảm bảo file cơ sở dữ liệu luôn giữ lại dữ liệu từ lần ghi cuối cùng, đánh đổi không gian để có logic xử lý đơn giản hơn.
+
+## MVCC (Multi-version concurrency control)
+Trong cơ sở dữ liệu thông thường, nếu có nhiều transaction thực thi đồng thời, `multi-version data` có thể xuất hiện. Nếu vấn đề `"khi nào thì dữ liệu đã được thay đổi trở nên visible với transaction nào"` không được xử lý tốt, các vấn đề không nhất quán dữ liệu có thể xảy ra. Những vấn đề này liên quan chặt chẽ đến `Isolation` và `Consistency` trong `ACID`.
+
+Ta sẽ lấy ví dụ cụ thể để làm rõ sự cần thiết của `multi-version data`.
+
+### Tại sao cần MVCC?
+Giả sử dữ liệu trong database nên thỏa mãn các điều kiện sau tại các thời điểm khác nhau:
+<Figure src={txExample1} alt="Transaction example"></Figure>
+
+
+| Thời điểm | Điều kiện thỏa mãn |
+|-----------|-------------------|
+| t &lt; t1 | Không có thay đổi nào xảy ra, được ghi nhận là version v1 |
+| t1 &lt;&#61; t &lt; t2 | Dữ liệu được persist sau khi RW-Tx-1 hoàn thành, được ghi nhận là version v2 |
+| t2 &lt;&#61; t &lt; t3 | Dữ liệu được persist sau khi RW-Tx-1 và RW-Tx-2 hoàn thành, được ghi nhận là version v3 |
+| t &gt;&#61; t3 | Dữ liệu được persist sau khi RW-Tx-1, RW-Tx-2 và RW-Tx-3 hoàn thành, được ghi nhận là version v4 |
+
+Nếu một read-only transaction rơi hoàn toàn trong một khoảng duy nhất từ đầu đến cuối, dữ liệu nó có thể thấy nên là version tương ứng với khoảng đó.
+
+Nhưng nếu read-only transaction vượt qua ranh giới của t1, t2, t3 thì sao?
+
+Ta lấy ví dụ như sau:
+- Nếu read-only transaction A bắt đầu trước t1 và kết thúc sau t3, nó nên đọc dữ liệu nào? v1, v2, v3, v4 đều có thể.
+- Nếu là v2 hoặc v3, điều đó sẽ làm user bối rối vì không thể chắc chắn data version nào họ có thể đọc mỗi lần. Cách tiếp cận hợp lý hơn nên là dữ liệu trước t1 hoặc dữ liệu sau t3, tức là v1 hoặc v4.
+- Nhưng nếu lấy v4, để đảm bảo dữ liệu được đọc bởi read-only transaction là nhất quán, read-only transaction đó sẽ bị chặn cho đến sau t3 trước khi được thực thi, từ đó gây gánh nặng cho cơ sở dữ liệu.
+- Do đó, thông thường tất cả dữ liệu được đọc bởi transaction A trước khi nó kết thúc nên là data version v1.
+
+Trong những trường hợp nhiều transaction thực thi đồng thời, để tạo ra một database đủ tiêu chuẩn, cần lưu trữ nhiều version của dữ liệu. Đây chính là MVCC.
+
+Trong các kịch bản nhiều transaction thực thi đồng thời, để tạo ra một cơ sở dữ liệu đủ tiêu chuẩn, cần lưu trữ nhiều phiên bản của dữ liệu. Đây là MVCC. Lưu trữ nhiều phiên bản của dữ liệu đơn lẻ trong cơ sở dữ liệu có thể cho phép read-only transaction không chặn read-write transaction, và read-write transaction không chặn read-only transaction. Read-only transaction sẽ chỉ đọc tất cả dữ liệu từ tất cả read-write transaction đã được commit khi transaction bắt đầu. Dữ liệu được ghi sau khi read-only transaction bắt đầu sẽ không được giao dịch chỉ đọc truy cập.
+
+### Bolt's MVCC Implementation
+Bolt cho phép tối đa một read-write transaction tiến hành đồng thời, do đó nó không cần xem xét các trường hợp nhiều read-write transaction tiến hành đồng thời khi hỗ trợ MVCC. Việc chỉ cho phép một read-write transaction tiến hành đồng thời có nghĩa là Bolt chỉ cần lưu trữ tối đa 2 version dữ liệu đồng thời không?
+
+<Figure src={txExample2} alt="Transaction example"></Figure>
+
+Thực tế không phải vậy. Xét trường hợp: giữa t3 và t4, read-only transaction RO-Tx-1 yêu cầu dữ liệu version v1 vẫn được lưu trong database; RO-Tx-2 yêu cầu dữ liệu version v2 vẫn được lưu trong database; RO-Tx-3 yêu cầu dữ liệu version v3 vẫn được lưu trong database. Do đó, ngay cả khi chỉ cho phép một read-write transaction tiến hành đồng thời, database vẫn cần lưu trữ dữ liệu nhiều version.
+
+Như đã giới thiệu trong phần Storage and Cache Management, Bolt chia database file thành các page có kích thước bằng nhau để lưu trữ metadata và dữ liệu.
+
+Nếu mỗi page mang theo một version, mỗi khi dữ liệu trong page sắp được thay đổi bởi read-write transaction, dữ liệu sẽ được copy trước vào page mới được yêu cầu, sau đó dữ liệu tương ứng được thay đổi. Các page version cũ chỉ được thu hồi khi không có read-only transaction nào phụ thuộc vào chúng.
+Sử dụng cách tiếp cận này này làm cho việc triển khai MVCC không cần xem xét việc cùng tồn tại version mới và cũ trong cùng một page, đánh đổi không gian để giảm độ phức tạp thiết kế, phù hợp với triết lý thiết kế của Bolt.
+
+### Các component quan trọng trong MVCC
+#### meta page
+Meta page lưu trữ thông tin metadata của database, bao gồm root bucket, etc. Trong quá trình thực thi read-write transaction, root bucket có thể được thay đổi trong quá trình thêm, xóa hoặc sửa đổi K-V data, gây ra thay đổi meta page. Do đó, khi khởi tạo transaction, mỗi transaction cần copy một metadata độc lập để ngăn việc thực thi read-write transaction ảnh hưởng đến read-only transaction.
+
+#### freelist page
+Freelist chịu trách nhiệm ghi lại thông tin page có thể cấp phát cho toàn bộ instance. Trong quá trình thực thi read-write transaction, các page mới được yêu cầu từ freelist, và các page cũng được release vào freelist, gây ra thay đổi freelist page. Vì Bolt chỉ cho phép một read-write transaction tiến hành đồng thời, và chỉ read-write transaction cần truy cập freelist page, do đó chỉ cần lưu một bản copy global của freelist page, không cần copy riêng.
+
+#### mmap
+Như đã giới thiệu trong phần Storage and Cache Management, Bolt ủy thác buffer đọc dữ liệu cho mmap. Mỗi read-only transaction cần lấy read lock của mmap khi bắt đầu để đảm bảo tính chính xác của dữ liệu đọc. Khi read-write transaction yêu cầu page mới, có thể có trường hợp không gian mmap hiện tại không đủ và cần re-mmap. Lúc này read-write transaction cần lấy write lock của mmap và phải chờ tất cả read-only transaction hoàn thành thực thi trước khi tiếp tục. Do đó Bolt cũng khuyến cáo người dùng rằng nếu có thể có read-only transaction chạy lâu, nhất định phải đặt initial size của mmap cao hơn một chút.
+
+#### Version numbering
+Mỗi khi Bolt thực thi read-write transaction mới, data version mới có thể được tạo. Do đó, miễn là read-write transaction id tăng đơn điệu, transaction id có thể được sử dụng làm data version number.
+
+## Serializability
+Bolt đảm bảo tính serializability thông qua kiến trúc đơn giản nhưng hiệu quả: chỉ cho phép duy nhất một read-write transaction thực thi tại một thời điểm.
+
+Khác với nhiều database khác chỉ đạt được "apparent serializability" (serializable về mặt hiện tượng), Bolt đạt được true serializability - các transaction thực sự được thực thi tuần tự.
+
+
+## Kết
+Vậy là ta đã tìm hiểu được Transaction System của Bolt - foundation cuối cùng cho một production-ready database. Từ file format đơn giản đến sophisticated concurrency control, từ B+ tree indexing đến MVCC, Bolt đã chứng minh rằng đôi khi "simple is better".
+
+Nhưng câu chuyện chưa kết thúc ở đây. Trong phần tiếp theo, chúng ta sẽ khám phá DB Layer - nơi tất cả các component này được kết hợp lại thành một unified API mà developers có thể sử dụng một cách intuitive và powerful.

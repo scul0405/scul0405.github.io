@@ -147,6 +147,7 @@ Bên cạnh đó, node cũng có một method đặc biệt liên quan đến vi
 - Tuy nhiên, đến một lúc cần cấp phát một bộ nhớ lớn hơn kích thước mmap hiện tại, mmap sẽ đơn giản là chuyển sang một vùng nhớ mới lớn hơn, khiến vùng nhớ cũ ban đầu trở lên không hợp lệ. Lúc này ta cần một cơ chế để giúp các inode vẫn trỏ đến đúng vùng nhớ chứa data hợp lệ như ban đầu. Vì vậy, dereference ra đời khi ta cần allocate lại một vùng nhớ mới có sử dụng đến mmap (vì nếu freelist còn đủ thì không việc gì phải allocate lại mmap cả).
 <Figure src={afterDereference} alt="After dereference"></Figure>
 
+## Kết
 Ơ mây zing gút chóp! Giờ ta đã hiểu cách B+ Tree tổ chức và tìm kiếm key-value pairs hiệu quả. Nhưng trong thực tế, một application thường không chỉ lưu một loại dữ liệu. Ví dụ: ta cần lưu cả user data, session data, config data... **Làm sao để tổ chức nhiều "namespaces" khác nhau trong cùng một database file mà không bị conflict?**
 
 Đây chính là lúc **Bucket System** ra đời - một abstraction layer cho phép ta tạo nhiều "containers" độc lập trong cùng một Bolt database. Phần sau ta sẽ tìm hiểu nó nhé.
