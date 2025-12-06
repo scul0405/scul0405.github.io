@@ -267,15 +267,26 @@ Nhìn chung, ta có thể thấy các hàm trong sds thường trả về sds. �
 được rằng nó có thực hiện đổi vùng nhớ hay không? Nếu có đổi thì vùng nhớ cũ lúc này đã invalid nên ta không dùng được nữa.
 Vì vậy, assign lại address sau các operation là một điều nên làm.
 
-Hàm `sdsResize` cũng sẽ được thực hiện với các quy trình khá tương tự. Ta chỉ cần biết quy trình nó diễn ra như nào, cấp phát,
+## Other functions
+Hàm `sdsResize` cũng sẽ được thực hiện với các quy trình khá tương tự `sdsMakeRoomFor`. Ta chỉ cần biết quy trình nó diễn ra như nào, cấp phát,
 thu hồi ra sao là được rồi.
 
-Thế thôi, các method khác loằng ngoằng lắm, nếu có thời gian thì sẽ đọc và update sau hẹ hẹ.
+Ngoài ra, còn có các function khác như:
+```c
+sdslen(const sds s): Get sds string length.
+sdssetlen(sds s, size_t newlen): Set sds string length.
+sdsinclen(sds s, size_t inc): Increase sds string length.
+sdsalloc(const sds s): Get sds string capacity.
+sdssetalloc(sds s, size_t newlen): Set sds string capacity.
+sdsavail(const sds s): Get sds string free space (i.e., alloc - len).
+sdsHdrSize(char type): Get header size based on header type.
+```
+
+Thế thôi, để mà giải thích hết thì khá dài, làm vậy thì cái blog loằng ngoằng lắm, nếu có thời gian thì mình sẽ đọc và update sau hẹ hẹ.
 
 ## Note
 ### _sdsMakeRoomFor
 ```c
-
 /* Enlarge the free space at the end of the sds string so that the caller
  * is sure that after calling this function can overwrite up to addlen
  * bytes after the end of the string, plus one more byte for nul term.
