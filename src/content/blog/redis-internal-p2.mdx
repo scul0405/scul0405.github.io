@@ -33,8 +33,8 @@ Do đó, Redis chọn hash table là giải thuật chính cho việc xây dựn
 - Dùng chaining để giải quyết hash collision.
 - Tự động expand memory khi đạt tới ngưỡng cấp phát.
 
-Tuy nhiên, có một cái khá là độc đáo của phiên bản `dict` này là `rehashing`. Đây là một kĩ thuật cho phép việc expand và đọc
-ghi diễn ra đồng thời. Cũng là thứ khó nhất khi triển khai `dict`. Chi tiết như nào thì tí sẽ biết.
+Tuy nhiên, có một cái khá là độc đáo của phiên bản `dict` này là `rehashing`. Đây là một kĩ thuật cho phép việc expand và đọc ghi không gây block
+trong một thời gian dài, cũng như timeout các client, cũng là thứ khó nhất khi triển khai `dict`. Chi tiết như nào thì tí sẽ biết.
 
 ## Data Structure
 ### Dict Entry
