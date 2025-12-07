@@ -188,8 +188,7 @@ Việc để một operation nào đó thực hiện việc di chuyển toàn b�
 toán ban đầu khi mà việc này lại gây ra block toàn bộ các client khác.
 
 Redis có một cơ chế để giải quyết vấn đề này bằng cách:
-- Với mỗi operation được client gọi dến, kiểm tra xem dict hiện tại
-có đang nằm trong trạng thái rehashing hay không?
+- Với mỗi operation được client gọi đến, kiểm tra xem dict hiện tại có đang nằm trong trạng thái rehashing hay không?
 - Nếu có, operation đó đóng vai trò như một công nhân phải phụ Redis thực hiện việc di chuyển 1 bucket từ `ht_table[1]` sang `ht_table[0]`
 tại vị trí `rehashidx`.
 - Sau khi chuyển xong bucket đó, tăng giá trị của `rehashidx` lên 1 (`rehashidx++`).
@@ -228,7 +227,7 @@ Khi duyệt qua toàn bộ các phần tử, Redis sẽ duyệt tuần tự từ
 thấy `iterator` lúc này đã duyệt đến hết `ht_table[0]`. Tuy nhiên, trong quá trình duyệt, một operation khác thực thi rehash
 khiến cho bucket tại index = 2 bị di chuyển sang `ht_table[1]`. Lúc này đến với step 2, `iterator` vẫn nằm im tại chỗ trong
 khi đã có biến đổi xảy ra tại cả 2 hash table, đồng nghĩa với việc `iterator` sẽ đọc qua phần tử nằm tại bucket có index = 2
-tại `ht_table[1]` một lần nữa, gây ra hiện tượng double read. Với các trường hợp chỉ cần scan kiếm dữ liệu thì ta có thể okay
+tại `ht_table[1]` một lần nữa, gây ra hiện tượng `double read`. Với các trường hợp chỉ cần scan kiếm dữ liệu thì ta có thể okay
 với chuyện này, tuy nhiên với các command liên quan tới đếm thì sẽ gây ra sai số tại đây.
 
 Redis giải quyết vấn đề này bằng `pauseRehash` counter. Field này sẽ tắt tạm thời việc xử lý `incremental rehashing` bằng cách:
@@ -246,7 +245,7 @@ chính xác tuyệt đối (`Consistency`) cho các tác vụ duyệt toàn bộ
 ## Find
 Các bước có thể mô tả đơn giản như sau:
 - Tính toán hash value cho key và vị trí cần tìm.
-- Thực hiện rehash nếu trạng thái hiện tại đang là rehashing.
+- Thực hiện rehash nếu trạng thái hiện tại đang là rehashing như mô tả ở trên.
 - Duyệt qua từng hash table (chỉ duyệt `ht_table[1]` nếu đang trong trạng thái rehashing). Với từng table, sử dụng hashed value để chỉ định
 đúng bucket cần duyệt. Trong quá trình tìm kiếm, sử dụng `cmpFunc` của dict để so sánh, nếu có thì trả về, nếu không thì
 duyệt tiếp qua chain tiếp theo.
