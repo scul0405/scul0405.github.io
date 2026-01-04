@@ -1,0 +1,358 @@
+---
+title: Làm tí Redis - P3 - Ziplist
+summary: Những thứ bé nhỏ nên lưu ở những cái bé nhỏ
+postLayout: column
+date: '2026-01-03'
+draft: true
+cover: '@/assets/redis-internal-p2/cover.png'
+tags: [database, redis]
+---
+
+## Preface
+
+Tài liệu được tham khảo từ source code của Redis v8. Các bạn có thể đọc tại đây: [Redis repository](https://github.com/redis/redis)
+
+Thích đọc code Go hơn? Có luôn. Mình có 1 bản minimal về các data structure tại đây: [Gedis repository](https://github.com/scul0405/gedis)
+
+---
+
+Sau khi nghịch SDS và Dict, ta đến với bộ môn trade-off.
+
+Redis đẻ ra một cấu trúc dữ liệu mới dùng để optimize memory - **Ziplist**.
+
+Thế tại sao Redis cần optimize memory?
+
+Khi lưu hàng triệu key mà mỗi key chỉ có vài byte data, nếu cứ tạo một linked list hay hash table chuẩn chỉnh thì overhead
+từ các con trỏ, metadata sẽ lớn hơn cả data thật. Chẳng hạn, để lưu một cái list gồm 2 phần tử nhỏ xíu, một linked list bình thường có thể tốn
+cả trăm byte chỉ cho các con trỏ `next`, `prev`, overhead của từng node. Quá lãng phí, tiết kiệm mới là thượng sách.
+
+Do đó, mấy ông dev Redis chỉ cần nghĩ là: `"Ờ thì tao sẽ làm một cái list đặc biệt, nén hết tất cả data liền nhau trong một mảng byte liên tục. Không con trỏ, không node,
+chỉ cần lưu byte thuần túy thôi"`. Và thế là ziplist ra đời.
+
+Ziplist được dùng chủ yếu khi data còn nhỏ. Chẳng hạn như khi tạo một `Hash` hay `List` mới trong Redis mà nó còn ít phần tử, Redis sẽ
+dùng ziplist làm data structure. Khi data phình to ra, nó mới chuyển sang dùng Dict hay LinkedList thực thụ.
+
+Ơ, nếu dùng Ziplist làm Hash thì O(1) của tôi đâu? Yên tâm, với n lúc này chỉ cỡ 512 thì O(n) với O(1) cũng không đáng để bận tâm đâu, như muối bỏ biển.
+
+## Data Structure
+
+Ziplist về cơ bản là một mảng byte liên tục trong memory, được cấu trúc như sau:
+
+```
+<zlbytes> <zltail> <zllen> <entry> <entry> ... <entry> <zlend>
+```
+
+Từng phần có ý nghĩa như sau:
+- `<zlbytes>`: 4 bytes (uint32_t), lưu tổng số byte mà ziplist chiếm. Cái này giúp ta biết kích thước ziplist mà không cần duyệt hết.
+- `<zltail>`: 4 bytes (uint32_t), offset đến entry cuối cùng. Nhờ có cái này, ta có thể nhảy thẳng đến tail để push/pop ở cuối list mà không cần duyệt từ đầu.
+- `<zllen>`: 2 bytes (uint16_t), số lượng entry trong ziplist. Tuy nhiên, vì chỉ có 16 bit nên tối đa biểu diễn được 2^16 - 1. Nếu số entry vượt quá,
+Redis sẽ set `<zllen>` thành 65535 (tức là 2^16 - 1) và để biết chính xác có bao nhiêu entry, ta phải duyệt toàn bộ ziplist.
+- `<entry>`: Mỗi entry lưu một phần tử data, có thể là string hoặc integer. Cấu trúc bên trong entry sẽ được giải thích sau.
+- `<zlend>`: 1 byte cuối cùng, có giá trị cố định là `0xFF` (255), đánh dấu kết thúc ziplist.
+
+Lưu ý, toàn bộ các field đều được lưu theo **little endian** format. Nghĩa là byte thấp nằm ở địa chỉ thấp.
+
+### Entry Structure
+
+Mỗi entry có cấu trúc như sau:
+```
+<prevlen> <encoding> <entry-data>
+```
+
+- `<prevlen>`: Lưu độ dài của entry trước đó. Cái này giúp ziplist có thể duyệt ngược từ cuối về đầu vì ziplist không có con trỏ `prev`
+như linked list thông thường, nên để đi ngược, ta phải biết entry trước nó dài bao nhiêu byte để nhảy ngược lại.
+- `<encoding>`: Lưu thông tin về kiểu dữ liệu và độ dài của data. Đây là phần phức tạp nhất của ziplist.
+- `<entry-data>`: Data thật sự. Có thể là string hoặc integer.
+
+### Encoding for prevlen
+
+`<prevlen>` có thể chiếm 1 byte hoặc 5 bytes:
+- Nếu entry trước đó có độ dài < 254 bytes, `<prevlen>` chỉ dùng 1 byte để lưu giá trị đó.
+- Nếu entry trước đó có độ dài >= 254 bytes, `<prevlen>` dùng 5 bytes: byte đầu tiên là `0xFE` (254) để đánh dấu, 4 bytes sau lưu giá trị thật.
+
+Tại sao không có giá trị 255 (0xFF)? Vì 255 đã được dùng làm marker cho `<zlend>` rồi. Nếu byte đầu tiên của một entry là 0xFF thì Redis sẽ
+nghĩ đó là kết thúc ziplist, do đó `<prevlen>` không bao giờ dùng 0xFF cho byte đầu.
+
+### Encoding for entry data
+
+Đây là phần phức tạp nhất. Tuỳ vào 2 bit đầu tiên của byte đầu tiên trong `<encoding>`, ta phân ra các trường hợp:
+
+**String encoding:**
+1. `|00pppppp|` - 1 byte: 2 bit đầu là `00`, 6 bit còn lại lưu độ dài string (tối đa 63 bytes).
+2. `|01pppppp|qqqqqqqq|` - 2 bytes: 2 bit đầu là `01`, 14 bit còn lại lưu độ dài string (tối đa 16383 bytes). Lưu ý: 14 bit này được lưu theo **big endian**.
+3. `|10000000|qqqqqqqq|rrrrrrrr|ssssssss|tttttttt|` - 5 bytes: 2 bit đầu là `10`, byte đầu là `0x80`, 4 bytes sau lưu độ dài string (tối đa 2^32-1 bytes).
+Cũng theo **big endian**.
+
+**Integer encoding:**
+Khi 2 bit đầu tiên là `11`, data được lưu dưới dạng integer:
+
+4. `|11000000|` (0xC0) - int16_t, 2 bytes data.
+5. `|11010000|` (0xD0) - int32_t, 4 bytes data.
+6. `|11100000|` (0xE0) - int64_t, 8 bytes data.
+7. `|11110000|` (0xF0) - 24-bit signed integer, 3 bytes data.
+8. `|11111110|` (0xFE) - 8-bit signed integer, 1 byte data.
+
+**Immediate encoding:**
+9. `|1111xxxx|` (với `xxxx` từ 0001 đến 1101) - Đây là trường hợp đặc biệt. 4 bit `xxxx` trực tiếp lưu giá trị integer từ 0 đến 12 (bằng `xxxx - 1`).
+Không cần `<entry-data>` riêng. Cực kỳ tiết kiệm cho các số nhỏ.
+
+Tại sao `xxxx` chỉ từ 0001 đến 1101? Vì:
+- `1111 0000` đã dùng cho int24
+- `1111 1110` đã dùng cho int8
+- `1111 1111` là `<zlend>`
+
+### Real-world Example
+
+Giả sử ta có ziplist lưu 2 string: `"2"` và `"5"`. Ziplist sẽ trông như sau (hex):
+
+```
+[0f 00 00 00] [0c 00 00 00] [02 00] [00 f3] [02 f6] [ff]
+      |             |          |       |       |     |
+   zlbytes        zltail     zllen    "2"     "5"   end
+```
+
+Giải thích:
+- `0f 00 00 00`: zlbytes = 15 bytes (little endian).
+- `0c 00 00 00`: zltail = 12 (offset đến entry cuối).
+- `02 00`: zllen = 2 entries.
+- `00 f3`: Entry đầu tiên
+  - `00`: prevlen = 0 (vì là entry đầu tiên)
+  - `f3`: encoding = `1111 0011`, tức `|1111xxxx|` với `xxxx = 0011` (3). Giá trị = 3 - 1 = 2.
+- `02 f6`: Entry thứ hai
+  - `02`: prevlen = 2 (entry trước chiếm 2 bytes)
+  - `f6`: encoding = `1111 0110`, tức `|1111xxxx|` với `xxxx = 0110` (6). Giá trị = 6 - 1 = 5.
+- `ff`: zlend.
+
+Thêm một string `"Hello World"` (11 bytes) vào cuối:
+```
+[02] [0b] [48 65 6c 6c 6f 20 57 6f 72 6c 64]
+```
+- `02`: prevlen = 2 (entry trước chiếm 2 bytes).
+- `0b`: encoding = `0000 1011`, tức `|00pppppp|` với `pppppp = 001011` (11). String dài 11 bytes.
+- `48 65 6c 6c 6f 20 57 6f 72 6c 64`: ASCII của "Hello World".
+
+## Creation
+
+Tạo một ziplist rỗng cực kỳ đơn giản:
+```c
+unsigned char *ziplistNew(void) {
+    unsigned int bytes = ZIPLIST_HEADER_SIZE+ZIPLIST_END_SIZE;
+    unsigned char *zl = zmalloc(bytes);
+    ZIPLIST_BYTES(zl) = intrev32ifbe(bytes);
+    ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(ZIPLIST_HEADER_SIZE);
+    ZIPLIST_LENGTH(zl) = 0;
+    zl[bytes-1] = ZIP_END;
+    return zl;
+}
+```
+
+Ziplist ban đầu chỉ có header (10 bytes) + zlend (1 byte) = 11 bytes. Cấu trúc:
+```
+[0b 00 00 00] [0a 00 00 00] [00 00] [ff]
+```
+
+## Insert Operation
+
+Insert trong ziplist phức tạp hơn nhiều so với linked list thông thường vì:
+1. Ziplist là một mảng liên tục, nên insert phải dịch chuyển toàn bộ data phía sau.
+2. Insert có thể làm thay đổi size của ziplist, trigger `realloc`, dẫn đến thay đổi địa chỉ memory.
+3. Insert còn có thể gây ra **cascade update** - sẽ giải thích ngay sau đây.
+
+### Cascade Update Problem
+
+Đây là vấn đề kinh điển của ziplist. Giả sử:
+- Entry A có độ dài 253 bytes.
+- Entry B nằm sau A, có `prevlen` = 1 byte (vì 253 < 254).
+- Giờ ta insert một entry mới có độ dài 500 bytes vào giữa A và B.
+
+Lúc này:
+- Entry B cần update `prevlen` để lưu 500 (>= 254), nên `prevlen` phải mở rộng từ 1 byte thành 5 bytes.
+- Entry B giờ dài hơn 4 bytes.
+- Nếu entry C nằm sau B cũng có `prevlen` = 1 byte và độ dài của B bây giờ >= 254, thì entry C cũng phải update `prevlen`.
+- Cứ thế lan truyền đến hết ziplist.
+
+Đây gọi là **cascade update**. Trong worst case, một insert có thể trigger update toàn bộ ziplist. Tuy nhiên, trường hợp này rất hiếm xảy ra trong thực tế.
+Nhưng nếu có thì nó sẽ khiến cho performance của nó khá tệ. Ở Redis 7.0+, các đại ca Dev đã đẻ ra 1 CDTL mới để giải quyết vấn đề này (hint: bài sau).
+
+### Insert Implementation
+
+```c
+static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p,
+                                      unsigned char *s, unsigned int slen) {
+    size_t curlen = intrev32ifbe(ZIPLIST_BYTES(zl)), reqlen;
+    unsigned int prevlensize, prevlen = 0;
+    // ...
+
+    // 1. Tính prevlen của entry mới
+    if (p[0] != ZIP_END) {
+        ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+    } else {
+        unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
+        if (ptail[0] != ZIP_END) {
+            prevlen = zipRawEntryLength(ptail);
+        }
+    }
+
+    // 2. Encode data (thử convert sang integer nếu được)
+    if (zipTryEncoding(s, slen, &value, &encoding)) {
+        reqlen = zipIntSize(encoding);
+    } else {
+        reqlen = slen;
+    }
+
+    // 3. Tính tổng size cần cho entry mới
+    reqlen += zipPrevEncodeLength(NULL, prevlen);
+    reqlen += zipEncodeLength(NULL, encoding, slen);
+
+    // 4. Kiểm tra xem entry tiếp theo có cần update prevlen không
+    nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p, reqlen) : 0;
+
+    // 5. Realloc ziplist
+    offset = p - zl;
+    zl = ziplistResize(zl, curlen + reqlen + nextdiff);
+    p = zl + offset;
+
+    // 6. Dịch chuyển data và insert
+    if (p[0] != ZIP_END) {
+        memmove(p + reqlen, p - nextdiff, curlen - offset - 1 + nextdiff);
+        zipPrevEncodeLength(p + reqlen, reqlen);
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl)) + reqlen);
+    }
+
+    // 7. Cascade update nếu cần
+    if (nextdiff != 0) {
+        zl = __ziplistCascadeUpdate(zl, p + reqlen);
+    }
+
+    // 8. Ghi entry mới
+    p += zipPrevEncodeLength(p, prevlen);
+    p += zipEncodeLength(p, encoding, slen);
+    if (ZIP_IS_STR(encoding)) {
+        memcpy(p, s, slen);
+    } else {
+        zipSaveInteger(p, value, encoding);
+    }
+    ZIPLIST_INCR_LENGTH(zl, 1);
+    return zl;
+}
+```
+
+Chú ý: Hàm này trả về `unsigned char *` mới, vì `realloc` có thể thay đổi địa chỉ của ziplist. Caller phải dùng pointer mới này.
+
+## Delete Operation
+
+Delete cũng tương tự insert, nhưng ngược lại:
+1. Tìm entry cần xoá.
+2. Xoá entry đó.
+3. Dịch chuyển toàn bộ data phía sau lên.
+4. Update `prevlen` của entry tiếp theo.
+5. Có thể trigger cascade update (nếu entry tiếp theo cần shrink `prevlen` từ 5 bytes về 1 byte).
+6. Shrink ziplist.
+
+```c
+unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p) {
+    size_t offset = *p-zl;
+    zl = __ziplistDelete(zl,*p,1);
+    *p = zl+offset;
+    return zl;
+}
+```
+
+## Traversal
+
+Ziplist hỗ trợ duyệt theo cả 2 hướng:
+
+**Forward traversal:**
+```c
+unsigned char *ziplistNext(unsigned char *zl, unsigned char *p) {
+    if (p[0] == ZIP_END) {
+        return NULL;
+    }
+
+    p = p + zipRawEntryLength(p);
+    if (p[0] == ZIP_END) {
+        return NULL;
+    }
+    return p;
+}
+```
+
+**Backward traversal:**
+```c
+unsigned char *ziplistPrev(unsigned char *zl, unsigned char *p) {
+    unsigned int prevlensize, prevlen = 0;
+
+    if (p[0] == ZIP_END) {
+        p = ZIPLIST_ENTRY_TAIL(zl);
+        return (p[0] == ZIP_END) ? NULL : p;
+    } else if (p == ZIPLIST_ENTRY_HEAD(zl)) {
+        return NULL;
+    } else {
+        ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+        return p - prevlen;
+    }
+}
+```
+
+Để duyệt ngược, ta chỉ cần đọc `prevlen` và nhảy ngược lại đúng số byte đó.
+
+## Hash and Ziplist
+
+Ziplist được dùng làm data structure cho Redis Hash khi hash còn nhỏ. Khi tạo một hash mới:
+
+```c
+robj *createHashObject(void) {
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(OBJ_HASH, zl);
+    o->encoding = OBJ_ENCODING_ZIPLIST;
+    return o;
+}
+```
+
+Khi thực hiện `HSET key field value`, Redis sẽ push field và value vào ziplist như 2 entry liên tiếp:
+```c
+hset user:100 name scul
+hset user:100 age 22
+```
+
+Ziplist lúc này sẽ lưu: `[name] [scul] [age] [22]`
+
+Redis có 2 config để quyết định khi nào convert ziplist sang dict:
+```
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+```
+
+- `hash-max-ziplist-entries 512`: Nếu hash có > 512 field-value pairs (tức > 1024 entries trong ziplist), convert sang dict.
+- `hash-max-ziplist-value 64`: Nếu có bất kỳ value nào dài > 64 bytes, convert sang dict.
+
+Tại sao phải convert? Vì khi ziplist quá lớn:
+1. Mỗi insert/update trigger `realloc` với xác suất cao hơn, dẫn đến memory copy tốn kém.
+2. Memory copy càng lớn thì càng chậm.
+3. Tìm kiếm trên ziplist phải duyệt tuần tự, O(n).
+
+Trong khi dict có O(1) lookup, mặc dù tốn memory hơn.
+
+## Trade-offs
+
+**Khen:**
+- Cực kỳ tiết kiệm memory khi data nhỏ. Không có overhead của pointers, nodes.
+- Cache-friendly: Data liền kề trong memory, CPU cache hit rate cao.
+- Đơn giản, dễ serialize (chỉ cần dump một mảng byte).
+
+**Chê:**
+- Insert/Delete tốn kém vì phải dịch chuyển data.
+- Cascade update có thể làm chậm trong worst case.
+- Lookup là O(n), không phù hợp với dataset lớn.
+- Không phù hợp với data thường xuyên thay đổi.
+
+**Do đó, Redis chỉ dùng ziplist khi**:
+- Data còn nhỏ.
+- Ít thao tác insert/delete.
+- Chủ yếu read hoặc append ở đầu/cuối.
+
+Khi data lớn lên, Redis tự động chuyển sang các data structure khác như dict, linkedlist, skiplist.
+
+## Related Resource
+- [Redis repository](https://github.com/redis/redis)

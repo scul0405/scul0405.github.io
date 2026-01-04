@@ -1,0 +1,379 @@
+---
+title: Làm tí Redis - P4 - Listpack
+summary: Khi Ziplist được nghỉ hưu
+postLayout: column
+date: '2026-01-04'
+draft: true
+cover: '@/assets/redis-internal-p2/cover.png'
+tags: [database, redis]
+---
+
+## Preface
+
+Tài liệu được tham khảo từ source code của Redis v8. Các bạn có thể đọc tại đây: [Redis repository](https://github.com/redis/redis)
+
+Thích đọc code Go hơn? Có luôn. Mình có 1 bản minimal về các data structure tại đây: [Gedis repository](https://github.com/scul0405/gedis)
+
+---
+
+Ở phần trước, ta đã nói về Ziplist - một data structure siêu tiết kiệm memory của Redis. Tuy nhiên, ta cũng đã thấy một vấn đề kinh điển của nó: **cascade update**.
+
+Hóa ra, vấn đề này nghiêm trọng đến mức mấy đại ca Redis quyết định phải thiết kế lại hoàn toàn. Và từ đó, **Listpack** ra đời để thay thế Ziplist.
+
+Vậy Listpack khác gì Ziplist? Tại sao nó lại tốt hơn? Làm sao nó giải quyết được cascade update? Đoán xem hihi.
+
+## Ziplist Problem
+
+Trước khi đi vào Listpack, hãy nhớ lại vấn đề cascade update của Ziplist.
+
+Trong Ziplist, mỗi entry có cấu trúc:
+```
+<prevlen> <encoding> <entry-data>
+```
+
+Field `prevlen` lưu độ dài của entry **trước đó**. Cái này giúp ta duyệt ngược được, nhưng lại gây ra vấn đề:
+
+Giả sử:
+- Entry A dài 253 bytes
+- Entry B nằm sau A, có `prevlen = 1 byte` (vì 253 < 254)
+- Ta insert entry C (500 bytes) vào giữa A và B
+
+Bùm, có biến xảy ra:
+- Entry B phải update `prevlen` từ 253 → 500
+- Vì 500 >= 254, `prevlen` phải expand từ 1 byte → 5 bytes
+- Entry B giờ dài hơn 4 bytes
+- Entry D (sau B) cũng phải update `prevlen` của nó
+- Nếu entry D cũng >= 254 bytes, nó cũng phải expand
+- Cứ thế **lan truyền** đến cuối ziplist
+
+-> Worst case: một insert có thể trigger update **toàn bộ** ziplist -> $O(n^2)$ complexity!
+
+Trong thực tế, trường hợp này hiếm xảy ra, nhưng khi nó xảy ra thì performance tụt thảm hại,
+tất nhiên Redis không chấp nhận được điều này (mặt đỏ tức giận).
+
+## Listpack Idea
+
+Ô, thế thì làm sao để duyệt ngược mà không cần lưu `prevlen`?
+
+Thì mình **Lưu độ dài của chính entry đó ở cuối entry** =)).
+
+Thay vì:
+```
+<prevlen> <encoding> <data>
+```
+
+Listpack làm như lày:
+```
+<encoding> <data> <backlen>
+```
+
+Field `backlen` lưu tổng độ dài của entry hiện tại (bao gồm cả encoding, data và chính backlen).
+
+Khi duyệt ngược:
+1. Đứng tại cuối entry hiện tại
+2. Đọc `backlen`
+3. Nhảy ngược lại đúng số byte đó
+4. Đến đầu entry trước
+
+Điểm mấu chốt ở đây là mỗi entry tự lưu độ dài của chính nó, không phụ thuộc vào entry khác!
+
+Do đó, khi insert/delete một entry, ta **chỉ cần** thay đổi entry đó, không cần update các entry khác. Cascade update bị tiêu diệt hoàn toàn!
+
+## Data Structure
+
+### Overall Layout
+
+Listpack có cấu trúc tổng thể:
+```
+<total-bytes> <num-elements> <entry> <entry> ... <entry> <EOF>
+```
+
+- `<total-bytes>`: 4 bytes (uint32_t), tổng số byte của listpack (giống `zlbytes` của ziplist)
+- `<num-elements>`: 2 bytes (uint16_t), số lượng entry. Nếu > 65535, set thành `LP_HDR_NUMELE_UNKNOWN` (65535)
+- `<entry>`: Các entry
+- `<EOF>`: 1 byte, giá trị `0xFF`, đánh dấu kết thúc (giống ziplist)
+
+### Entry Structure
+
+Mỗi entry có cấu trúc:
+```
+<encoding> <data> <backlen>
+```
+
+- **encoding**: Lưu kiểu dữ liệu và độ dài (string hoặc integer)
+- **data**: Data thật sự (có thể không có nếu encoding đã chứa data, như 7-bit uint)
+- **backlen**: Lưu tổng độ dài của entry (encoding + data + backlen), encode theo **variable-length**
+
+### Encoding Types
+
+Listpack có encoding sạch sẽ hơn ziplist:
+
+**Integer encodings:**
+1. **7-bit uint** (0xxxxxxx): Integer 0-127, chỉ 1 byte cho toàn bộ entry
+2. **13-bit int** (110xxxxx + 1 byte): Integer từ -4096 đến 4095
+3. **16-bit int** (0xF1 + 2 bytes): int16_t
+4. **24-bit int** (0xF2 + 3 bytes): 24-bit signed
+5. **32-bit int** (0xF3 + 4 bytes): int32_t
+6. **64-bit int** (0xF4 + 8 bytes): int64_t
+
+**String encodings:**
+1. **6-bit string** (10xxxxxx): String dài < 64 bytes, encoding chiếm 1 byte
+2. **12-bit string** (1110xxxx + 1 byte): String dài < 4096 bytes, encoding chiếm 2 bytes
+3. **32-bit string** (0xF0 + 4 bytes): String lớn, encoding chiếm 5 bytes
+
+### Backlen Encoding
+
+Đây là phần độc đáo của listpack. `backlen` được encode theo **variable-length reverse encoding**:
+
+- Mỗi byte có format: `[7-bit data][1-bit continue]`
+- Bit thấp nhất (LSB) là continue bit:
+  - `1`: Còn byte tiếp theo
+  - `0`: Byte cuối cùng
+- 7 bit còn lại lưu data
+
+Ví dụ:
+- Nếu entry dài 100 bytes: `backlen = 100 = 0b01100100`
+  - Chỉ cần 1 byte: `01100100` (LSB = 0, không có byte tiếp theo)
+- Nếu entry dài 300 bytes: `backlen = 300 = 0b100101100`
+  - Cần 2 bytes:
+    - Byte 1: `00000010` (2 bit cao)
+    - Byte 2: `10101101` (7 bit thấp + continue bit = 1)
+  - Khi đọc ngược: đọc byte 2 trước, thấy LSB = 1, tiếp tục đọc byte 1
+
+Code decode:
+```c
+static inline uint64_t lpDecodeBacklen(unsigned char *p) {
+    uint64_t val = 0;
+    uint64_t shift = 0;
+    do {
+        val |= (uint64_t)(p[0] & 127) << shift;
+        if (!(p[0] & 128)) break;  // LSB = 0, dừng
+        shift += 7;
+        p--;  // Đọc ngược
+        if (shift > 28) return UINT64_MAX;  // Invalid
+    } while(1);
+    return val;
+}
+```
+
+Backlen chiếm 1-5 bytes tuỳ vào độ dài entry:
+- Nếu bé hơn hoặc bằng 127: 1 byte
+- Nếu bé hơn hoặc bằng 16383: 2 bytes
+- Nếu bé hơn hoặc bằng 2097151: 3 bytes
+- Nếu bé hơn hoặc bằng 268435455: 4 bytes
+- Nếu lớn hơn: 5 bytes
+
+## Real-world Example
+
+Giả sử ta có listpack lưu 2 số: `2` và `5`.
+
+```
+[0f 00 00 00] [02 00] [02 01] [05 01] [ff]
+      |          |       |       |      |
+   total      nelems    "2"     "5"   EOF
+```
+
+Nó sẽ như này:
+- `0f 00 00 00`: total-bytes = 15
+- `02 00`: num-elements = 2
+- `02 01`: Entry 1
+  - `02`: encoding = 7-bit uint = 2
+  - `01`: backlen = 1 (entry này dài 1 byte: chỉ có encoding)
+- `05 01`: Entry 2
+  - `05`: encoding = 7-bit uint = 5
+  - `01`: backlen = 1
+- `ff`: EOF
+
+Chú ý: Với 7-bit uint, data đã nằm trong encoding byte rồi, nên không cần `<data>` riêng!
+
+Giờ thêm string "hello" (5 bytes):
+```
+Entry: [85 68 65 6c 6c 6f 07]
+```
+- `85`: encoding = 6-bit string, length = 5 (10000101 → 0b000101 = 5)
+- `68 65 6c 6c 6f`: "hello" (ASCII)
+- `07`: backlen = 7 (1 byte encoding + 5 bytes data + 1 byte backlen)
+
+## Traversal
+
+### Forward Traversal
+
+Duyệt xuôi đơn giản: đọc encoding, tính size của entry, nhảy qua.
+
+```c
+static inline unsigned char *lpSkip(unsigned char *p) {
+    unsigned long entrylen = lpCurrentEncodedSizeUnsafe(p);  // Đọc encoding để tính size
+    entrylen += lpEncodeBacklenBytes(entrylen);              // Cộng thêm size của backlen
+    p += entrylen;
+    return p;
+}
+
+unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
+    p = lpSkip(p);
+    if (p[0] == LP_EOF) return NULL;
+    return p;
+}
+```
+
+### Backward Traversal
+
+Duyệt ngược là điểm mạnh của listpack:
+
+```c
+unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
+    if (p-lp == LP_HDR_SIZE) return NULL;  // Đã ở đầu
+
+    p--;  // Lùi 1 byte để đến backlen byte cuối
+    uint64_t prevlen = lpDecodeBacklen(p);      // Đọc backlen
+    prevlen += lpEncodeBacklenBytes(prevlen);   // Cộng thêm size của backlen
+    p -= prevlen-1;  // Nhảy ngược về đầu entry trước
+
+    return p;
+}
+```
+
+Xời, **không còn cascade update** vì mỗi entry tự lưu size của chính nó!
+
+## Insert Operation
+
+Insert trong listpack đơn giản hơn ziplist rất nhiều:
+
+```c
+unsigned char *lpInsert(unsigned char *lp, unsigned char *ele, uint32_t size,
+                        unsigned char *p, int where, unsigned char **newp)
+{
+    // 1. Encode element mới
+    unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+    uint64_t enclen;
+    int enctype = lpEncodeGetType(ele, size, intenc, &enclen);
+
+    // 2. Tính backlen size
+    uint64_t backlen_size = lpEncodeBacklenBytes(enclen);
+
+    // 3. Tính tổng size cần insert
+    uint64_t new_entry_len = enclen + backlen_size;
+
+    // 4. Realloc listpack
+    lp = lp_realloc(lp, lpGetTotalBytes(lp) + new_entry_len);
+
+    // 5. Dịch chuyển data phía sau để tạo chỗ trống
+    memmove(p + new_entry_len, p, ...);
+
+    // 6. Ghi entry mới vào
+    // - Ghi encoding + data
+    // - Ghi backlen ở cuối
+
+    // 7. Update header (total-bytes, num-elements)
+
+    return lp;
+}
+```
+
+**Cũng hông có cascade update**, ta chỉ cần:
+- Insert entry mới
+- Dịch data phía sau
+- Update header
+
+Complexity: $O(n)$ cho memmove, nhưng **không có worst case $O(n^2)$** như ziplist.
+
+## Ziplist vs Listpack
+
+| Aspect | Ziplist | Listpack |
+|--------|---------|----------|
+| Entry structure | `<prevlen><encoding><data>` | `<encoding><data><backlen>` |
+| Cascade update | **Có** (worst case $O(n^2)$) | **Không** (luôn $O(n)$) |
+| Backward traversal | Đọc prevlen ở đầu | Đọc backlen ở cuối |
+| Encoding types | 9 types (phức tạp) | 9 types (sạch hơn) |
+| Memory overhead | Thấp | Tương đương |
+| Insert/Delete | Có thể rất chậm | Ổn định |
+| Code complexity | Phức tạp (cascade logic) | Đơn giản hơn |
+
+## Migration from Ziplist to Listpack
+
+Redis không dại gì mà migrate tất cả cùng lúc. Thay vào đó, từ **Redis 7.0+**, các cấu trúc dữ liệu sau được replace:
+- **Hash**: Chuyển từ ziplist sang listpack
+- **Zset**: Chuyển từ ziplist sang listpack
+- **List**: Đã dùng quicklist (kết hợp ziplist), giờ dùng quicklist + listpack
+- **Stream**: Luôn dùng listpack từ đầu
+
+Config mới:
+```
+# Previous (ziplist)
+hash-max-ziplist-entries 512
+hash-max-ziplist-value 64
+
+# Now (listpack)
+hash-max-listpack-entries 512
+hash-max-listpack-value 64
+```
+
+## Code Comparison
+
+### Ziplist Insert (include cascade update)
+```c
+static unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, ...) {
+    // ...
+    nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p, reqlen) : 0;
+
+    // Realloc
+    zl = ziplistResize(zl, curlen + reqlen + nextdiff);
+
+    // ...
+
+    // Cascade update!!!
+    if (nextdiff != 0) {
+        zl = __ziplistCascadeUpdate(zl, p + reqlen);  // O(n) in worst case
+    }
+
+    return zl;
+}
+```
+
+### Listpack Insert (NO cascade)
+```c
+unsigned char *lpInsert(unsigned char *lp, ...) {
+    // Encode
+    int enctype = lpEncodeGetType(ele, size, intenc, &enclen);
+    uint64_t backlen_size = lpEncodeBacklenBytes(enclen);
+
+    // Realloc
+    lp = lp_realloc(lp, lpGetTotalBytes(lp) + enclen + backlen_size);
+
+    // Memmove
+    memmove(p + enclen + backlen_size, p, ...);
+
+    // Write entry
+    // ...
+
+    // DONE! No cascade!
+    return lp;
+}
+```
+
+## Limitations
+
+Mặc dù listpack tốt hơn ziplist, thế nhưng nó vẫn có hạn chế vì đơn giản nó chỉ nhắm tới việc xử lý cascade update:
+
+1. **Vẫn là contiguous memory**: Insert/delete vẫn cần memmove, $O(n)$
+2. **Không tốt cho large dataset**: Lookup vẫn O(n), không có index
+3. **Memory realloc**: Vẫn có thể trigger copy khi resize
+
+Do đó, Redis vẫn chỉ dùng listpack cho **small data**:
+- Hash nhỏ (< 512 entries, < 64 bytes per value)
+- Zset nhỏ
+- List segments trong quicklist
+
+Khi data lớn, Redis tự động chuyển sang Dict/Skiplist tương tự như Ziplist đã làm.
+
+## Summary
+
+Listpack là một improvement quan trọng của Redis. Nó giữ được ưu điểm memory-efficient của ziplist, nhưng loại bỏ hoàn toàn cascade update problem.
+
+Ý tưởng đơn giản nhưng hay vl: **Thay vì lưu prevlen ở đầu, lưu backlen ở cuối**.
+Đây là một ví dụ điển hình về data structure design: đôi khi một thay đổi nhỏ trong layout có thể giải quyết một vấn đề lớn về complexity.
+
+Redis đã migrate hầu hết use cases từ ziplist sang listpack. Nếu bạn đang dùng Redis 7.0+ thì bạn đang xài listpack là chủ yếu đó ^^.
+
+## Related Resource
+- [Redis repository](https://github.com/redis/redis)
+- [Listpack specification](https://github.com/antirez/listpack)
